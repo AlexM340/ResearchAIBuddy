@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Data
+data/uploaded_docs/*
+!data/uploaded_docs/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+data/test_docs/*
+!data/test_docs/.gitkeep
+data/
+
+# Logs
+logs/
+*.log
+
+# Backup
+backup/
+backup_before_cleanup/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env.local
+.env.production
+.env
+
+# Temporary
+temp/
+tmp/
+
+cleanup_project.py

@@ -1,0 +1,58 @@
+{
+    "gemini_api_key": "",
+    "openai_api_key": "",
+    "tavily_api_key": "",
+    "wandb_api_key": "",
+    "models": {
+        "primary_llm": "gemini-2.5-flash",
+        "fallback_llm": "gemini-2.0-flash-exp",
+        "local_llm": "llama3:instruct",
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "evaluation_model": "gemini-2.5-flash"
+    },
+    "gemini": {
+        "temperature": 0.1,
+        "rate_limits": {
+            "requests_per_minute": 30,
+            "requests_per_day": 3000
+        }
+    },
+    "vector_db": {
+        "type": "faiss",
+        "index_path": "./data/cache/vector_index"
+    },
+    "chunking": {
+        "chunk_size": 1000,
+        "chunk_overlap": 200,
+        "use_semantic_chunking": true,
+        "max_context_docs": 5
+    },
+    "rag": {    
+        "retrieval_k": 5,
+        "use_hy~brid_search": true,
+        "use_reranking": true,
+        "compression_enabled": true,
+        "use_cache": true
+    },
+    "agent": {
+        "max_iterations": 10,
+        "enable_reflection": true,
+        "enable_planning": true,
+        "enable_tools": true
+    },
+    "evaluation": {
+        "use_ai_judge": true,
+        "metrics": ["faithfulness", "relevance", "coherence"]
+    },
+    "ui": {
+        "title": "APCI - Asistentul Personalizat de Cercetare și Învățare",
+        "theme": "dark",
+        "sidebar_width": 300
+    },
+    "features": {
+        "multimodal": false,
+        "web_search": false,
+        "auto_save": true,
+        "export_formats": ["txt", "md", "pdf"]
+    }
+}
