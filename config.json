@@ -27,9 +27,12 @@
         "use_semantic_chunking": true,
         "max_context_docs": 5
     },
-    "rag": {    
-        "retrieval_k": 5,
-        "use_hy~brid_search": true,
+    "rag": {
+        "retrieval_candidates": 20,
+        "rerank_top_k": 8,
+        "neighbor_window": 1,
+        "hybrid_alpha": 0.7,
+        "use_hybrid_search": true,
         "use_reranking": true,
         "compression_enabled": true,
         "use_cache": true

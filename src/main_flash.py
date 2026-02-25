@@ -8,7 +8,7 @@ import os
 import json
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 
 # Încarcă variabilele de mediu din .env
@@ -47,6 +47,47 @@ except ImportError as e:
     DOCUMENT_MANAGER_AVAILABLE = False
     st.error(f"Document Manager nu este disponibil: {e}")
 
+try:
+    from chat_session_manager import ChatSessionManager
+    CHAT_SESSION_MANAGER_AVAILABLE = True
+except ImportError as e:
+    CHAT_SESSION_MANAGER_AVAILABLE = False
+    st.error(f"Chat Session Manager nu este disponibil: {e}")
+
+GENERAL_COLLECTION_NAME = "general"
+QUERY_MODE_LABELS = {
+    "topic": "Doar Topic",
+    "topic_general": "Topic + General",
+    "all": "Toate Sursele"
+}
+DEFAULT_CHAT_TITLE = "Chat nou"
+
+def normalize_collection_name(name: str) -> str:
+    """Normalizează numele colecției și aplică fallback pentru general."""
+    cleaned = (name or "").strip()
+    return cleaned if cleaned else GENERAL_COLLECTION_NAME
+
+def is_general_collection(name: str) -> bool:
+    """Verifică dacă o colecție este colecție generală."""
+    normalized = normalize_collection_name(name).lower()
+    return normalized in {GENERAL_COLLECTION_NAME, "default"}
+
+def build_metadata_entry(doc_id: str, doc_info: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
+    """Construiește metadata standardizată pentru indexare și filtrare la query."""
+    collection = normalize_collection_name(doc_info.get("collection", GENERAL_COLLECTION_NAME))
+    source_scope = "general" if is_general_collection(collection) else "topic"
+    resolved_path = str(file_path.resolve())
+
+    return {
+        "doc_id": doc_id,
+        "filename": doc_info.get("original_name", file_path.name),
+        "original_name": doc_info.get("original_name", file_path.name),
+        "file_type": doc_info.get("file_type", file_path.suffix),
+        "collection": collection,
+        "source_scope": source_scope,
+        "source_path": resolved_path
+    }
+
 def load_config() -> Dict[str, Any]:
     """Încarcă configurația din fișier cu fallback la valori implicite"""
     config_path = Path("config.json")
@@ -70,6 +111,12 @@ def load_config() -> Dict[str, Any]:
             "chunk_overlap": 200,
             "max_context_docs": 5
         },
+        "rag": {
+            "retrieval_candidates": 20,
+            "rerank_top_k": 8,
+            "neighbor_window": 1,
+            "hybrid_alpha": 0.7
+        },
         "ui": {
             "title": "APCI - Asistentul Personalizat de Cercetare și Învățare",
             "theme": "dark"
@@ -85,7 +132,7 @@ def load_config() -> Dict[str, Any]:
             merged_config = default_config.copy()
             
             # Merge secțiuni principale
-            for key in ['models', 'gemini', 'chunking', 'ui']:
+            for key in ['models', 'gemini', 'chunking', 'rag', 'ui']:
                 if key in file_config:
                     if key in merged_config:
                         merged_config[key].update(file_config[key])
@@ -105,6 +152,26 @@ def load_config() -> Dict[str, Any]:
     
     return default_config
 
+def build_apci_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Construiește configurația APCI folosită la inițializarea sistemului."""
+    rag_config = config.get("rag", {})
+    return {
+        'model_name': config['models']['primary_llm'],
+        'fallback_model': config['models']['fallback_llm'],
+        'temperature': config['gemini']['temperature'],
+        'max_tokens': config['gemini']['max_tokens'],
+        'max_context_docs': config['chunking']['max_context_docs'],
+        'chunk_size': config['chunking']['chunk_size'],
+        'chunk_overlap': config['chunking']['chunk_overlap'],
+        'cache_enabled': True,
+        'rate_limit_rpm': config['gemini']['rate_limits']['requests_per_minute'],
+        'rate_limit_rpd': config['gemini']['rate_limits']['requests_per_day'],
+        'retrieval_candidates': rag_config.get("retrieval_candidates", 20),
+        'rerank_top_k': rag_config.get("rerank_top_k", 8),
+        'neighbor_window': rag_config.get("neighbor_window", 1),
+        'hybrid_alpha': rag_config.get("hybrid_alpha", 0.7)
+    }
+
 def initialize_session_state():
     """Inițializează starea sesiunii"""
     if 'apci_system' not in st.session_state:
@@ -115,6 +182,18 @@ def initialize_session_state():
     
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
+
+    if 'chat_manager' not in st.session_state and CHAT_SESSION_MANAGER_AVAILABLE:
+        st.session_state.chat_manager = ChatSessionManager()
+
+    if 'active_chat_id' not in st.session_state:
+        st.session_state.active_chat_id = ""
+
+    if 'chat_title_draft' not in st.session_state:
+        st.session_state.chat_title_draft = ""
+
+    if 'chat_title_input' not in st.session_state:
+        st.session_state.chat_title_input = DEFAULT_CHAT_TITLE
     
     if 'system_stats' not in st.session_state:
         st.session_state.system_stats = None
@@ -123,7 +202,7 @@ def initialize_session_state():
         st.session_state.document_manager = DocumentManager()
     
     if 'current_tab' not in st.session_state:
-        st.session_state.current_tab = "Chat"
+        st.session_state.current_tab = "💬 Chat"
     
     if 'selected_documents' not in st.session_state:
         st.session_state.selected_documents = []
@@ -134,6 +213,133 @@ def initialize_session_state():
     
     if 'auto_load_attempted' not in st.session_state:
         st.session_state.auto_load_attempted = False
+
+    if 'query_mode' not in st.session_state:
+        st.session_state.query_mode = "topic_general"
+
+    if 'active_topic_collection' not in st.session_state:
+        st.session_state.active_topic_collection = ""
+
+    if 'upload_collection' not in st.session_state:
+        st.session_state.upload_collection = GENERAL_COLLECTION_NAME
+
+def get_chat_manager() -> Optional["ChatSessionManager"]:
+    """Return chat session manager if available."""
+    manager = st.session_state.get("chat_manager")
+    return manager if CHAT_SESSION_MANAGER_AVAILABLE else None
+
+def format_chat_label(session_info: Dict[str, Any]) -> str:
+    """Build a compact label for chat selector."""
+    title = session_info.get("title", DEFAULT_CHAT_TITLE)
+    topic = session_info.get("topic_collection", "")
+    count = session_info.get("message_count", 0)
+    topic_label = topic if topic else "fara topic"
+    return f"{title} [{topic_label}] ({count})"
+
+def ensure_active_chat_session() -> None:
+    """Ensure there is always one active chat session."""
+    manager = get_chat_manager()
+    if not manager:
+        return
+
+    sessions = manager.list_sessions()
+    if not sessions:
+        created = manager.create_session(
+            title=DEFAULT_CHAT_TITLE,
+            topic_collection=st.session_state.get("active_topic_collection", ""),
+            query_mode=st.session_state.get("query_mode", "topic_general"),
+        )
+        st.session_state.active_chat_id = created["id"]
+        st.session_state.chat_history = []
+        st.session_state.chat_title_draft = created.get("title", DEFAULT_CHAT_TITLE)
+        st.session_state.chat_title_input = st.session_state.chat_title_draft
+        return
+
+    active_chat_id = st.session_state.get("active_chat_id", "")
+    existing_ids = {item["id"] for item in sessions}
+    if active_chat_id not in existing_ids:
+        active_chat_id = sessions[0]["id"]
+        st.session_state.active_chat_id = active_chat_id
+
+    active_session = manager.load_session(active_chat_id) or {}
+    st.session_state.chat_history = active_session.get("messages", [])
+    st.session_state.chat_title_draft = active_session.get("title", DEFAULT_CHAT_TITLE)
+    st.session_state.chat_title_input = st.session_state.chat_title_draft
+
+def persist_active_chat_state(
+    *,
+    title: Optional[str] = None,
+    topic_collection: Optional[str] = None,
+    query_mode: Optional[str] = None,
+) -> None:
+    """Persist active chat messages and metadata."""
+    manager = get_chat_manager()
+    if not manager:
+        return
+
+    active_chat_id = st.session_state.get("active_chat_id", "")
+    if not active_chat_id:
+        return
+
+    manager.save_session(
+        active_chat_id,
+        st.session_state.get("chat_history", []),
+        title=title,
+        topic_collection=topic_collection,
+        query_mode=query_mode,
+    )
+
+def switch_active_chat(session_id: str) -> None:
+    """Load selected chat in session state."""
+    manager = get_chat_manager()
+    if not manager or not session_id:
+        return
+
+    session_data = manager.load_session(session_id)
+    if not session_data:
+        return
+
+    st.session_state.active_chat_id = session_id
+    st.session_state.chat_history = session_data.get("messages", [])
+    st.session_state.chat_title_draft = session_data.get("title", DEFAULT_CHAT_TITLE)
+    st.session_state.chat_title_input = st.session_state.chat_title_draft
+
+    saved_mode = session_data.get("query_mode")
+    if saved_mode in QUERY_MODE_LABELS:
+        st.session_state.query_mode = saved_mode
+
+    st.session_state.active_topic_collection = session_data.get("topic_collection", "")
+
+def create_and_switch_chat(
+    title: str = DEFAULT_CHAT_TITLE,
+    topic_collection: Optional[str] = None,
+    query_mode: Optional[str] = None,
+) -> None:
+    """Create a chat and make it active."""
+    manager = get_chat_manager()
+    if not manager:
+        return
+
+    created = manager.create_session(
+        title=title,
+        topic_collection=topic_collection if topic_collection is not None else st.session_state.get("active_topic_collection", ""),
+        query_mode=query_mode if query_mode is not None else st.session_state.get("query_mode", "topic_general"),
+    )
+    switch_active_chat(created["id"])
+
+def delete_active_chat() -> None:
+    """Delete active chat and fallback to another one."""
+    manager = get_chat_manager()
+    if not manager:
+        return
+
+    active_chat_id = st.session_state.get("active_chat_id", "")
+    if not active_chat_id:
+        return
+
+    manager.delete_session(active_chat_id)
+    st.session_state.active_chat_id = ""
+    ensure_active_chat_session()
 
 def auto_load_library_documents():
     """
@@ -176,35 +382,30 @@ def auto_load_library_documents():
             # Inițializează sistemul APCI dacă nu există
             if not st.session_state.apci_system:
                 config = load_config()
-                config_dict = {
-                    'model_name': config['models']['primary_llm'],
-                    'fallback_model': config['models']['fallback_llm'],
-                    'temperature': config['gemini']['temperature'],
-                    'max_tokens': config['gemini']['max_tokens'],  # Now 65536
-                    'max_context_docs': config['chunking']['max_context_docs'],
-                    'chunk_size': config['chunking']['chunk_size'],
-                    'chunk_overlap': config['chunking']['chunk_overlap'],
-                    'cache_enabled': True,
-                    'rate_limit_rpm': config['gemini']['rate_limits']['requests_per_minute'],
-                    'rate_limit_rpd': config['gemini']['rate_limits']['requests_per_day']
-                }
+                config_dict = build_apci_config_dict(config)
                 st.session_state.apci_system = create_apci_system(api_key, config_dict)
             
             # Obține căile fișierelor din bibliotecă
             file_paths = []
             loaded_docs = []
+            metadata_by_path = {}
             
             for doc_id in doc_ids:
                 file_path = st.session_state.document_manager.get_document_file_path(doc_id)
                 doc_info = st.session_state.document_manager.get_document_info(doc_id)
                 
                 if file_path and file_path.exists() and doc_info:
-                    file_paths.append(str(file_path))
+                    resolved_path = str(file_path.resolve())
+                    file_paths.append(resolved_path)
                     loaded_docs.append(doc_info['original_name'])
+                    metadata_by_path[resolved_path] = build_metadata_entry(doc_id, doc_info, file_path)
             
             if file_paths:
                 # Procesează documentele
-                success = st.session_state.apci_system.load_documents(file_paths)
+                success = st.session_state.apci_system.load_documents(
+                    file_paths,
+                    metadata_by_path=metadata_by_path
+                )
                 
                 if success:
                     st.session_state.documents_loaded = True
@@ -254,9 +455,68 @@ def setup_sidebar():
             st.warning("API Key necesar pentru funcționare")
         
         st.divider()
+
+        # Conversații persistente
+        st.subheader("Conversații")
+        chat_manager = get_chat_manager()
+        if chat_manager:
+            ensure_active_chat_session()
+            sessions = chat_manager.list_sessions()
+            session_map = {item["id"]: item for item in sessions}
+            session_ids = list(session_map.keys())
+
+            if session_ids:
+                active_chat_id = st.session_state.get("active_chat_id", "")
+                default_index = session_ids.index(active_chat_id) if active_chat_id in session_ids else 0
+
+                selected_chat_id = st.selectbox(
+                    "Chat activ",
+                    options=session_ids,
+                    index=default_index,
+                    format_func=lambda chat_id: format_chat_label(session_map[chat_id]),
+                    key="chat_selector_sidebar",
+                )
+
+                if selected_chat_id != active_chat_id:
+                    switch_active_chat(selected_chat_id)
+                    st.rerun()
+
+                col_chat1, col_chat2 = st.columns(2)
+                with col_chat1:
+                    if st.button("Chat nou", use_container_width=True):
+                        create_and_switch_chat()
+                        st.rerun()
+                with col_chat2:
+                    if st.button("Șterge chat", use_container_width=True):
+                        delete_active_chat()
+                        st.rerun()
+
+                chat_title = st.text_input("Titlu chat", key="chat_title_input")
+                if st.button("Salvează titlu", use_container_width=True):
+                    active_id = st.session_state.get("active_chat_id", "")
+                    if active_id:
+                        chat_manager.rename_session(active_id, chat_title)
+                        st.session_state.chat_title_draft = chat_title
+                        st.success("Titlul a fost actualizat.")
+                        st.rerun()
+            else:
+                st.info("Nu există chat-uri salvate încă.")
+        else:
+            st.warning("Persistența chat-urilor nu este disponibilă.")
+
+        st.caption("Stocare chat-uri: data/chat_sessions/")
+        st.divider()
         
         # Încărcare documente
         st.subheader("Încărcare Documente")
+
+        target_collection = st.text_input(
+            "Colecție destinație (topic sau general)",
+            value=st.session_state.get("upload_collection", GENERAL_COLLECTION_NAME),
+            help="Folosește 'general' pentru surse globale sau un nume de topic pentru surse tematice."
+        )
+        target_collection = normalize_collection_name(target_collection)
+        st.session_state.upload_collection = target_collection
         
         uploaded_files = st.file_uploader(
             "Alege fișiere",
@@ -267,7 +527,7 @@ def setup_sidebar():
         
         if uploaded_files and api_key:
             if st.button("Procesează Documente", type="primary"):
-                process_documents(uploaded_files, api_key)
+                process_documents(uploaded_files, api_key, target_collection=target_collection)
         
         st.divider()
         
@@ -296,7 +556,7 @@ def setup_sidebar():
             
             # Buton pentru a deschide biblioteca completă
             if st.button("Deschide Biblioteca", type="secondary"):
-                st.session_state.current_tab = "Biblioteca"
+                st.session_state.current_tab = "📚 Biblioteca"
                 st.rerun()
             
             # Selector rapid pentru documente existente
@@ -439,7 +699,7 @@ def setup_sidebar():
             except Exception as e:
                 st.warning(f"Nu s-au putut obține statistici cache: {e}")
 
-def process_documents(uploaded_files, api_key: str):
+def process_documents(uploaded_files, api_key: str, target_collection: str = GENERAL_COLLECTION_NAME):
     """Procesează documentele încărcate - încărcare incrementală"""
     if not RAG_MODULE_AVAILABLE:
         st.error("Modulul RAG nu este disponibil")
@@ -451,18 +711,7 @@ def process_documents(uploaded_files, api_key: str):
             with st.spinner("🔄 Inițializez sistemul APCI..."):
                 # Configurație pentru sistem - folosește configurația globală
                 config = load_config()
-                config_dict = {
-                    'model_name': config['models']['primary_llm'],
-                    'fallback_model': config['models']['fallback_llm'],
-                    'temperature': config['gemini']['temperature'],
-                    'max_tokens': config['gemini']['max_tokens'],  # Now 65536
-                    'max_context_docs': config['chunking']['max_context_docs'],
-                    'chunk_size': config['chunking']['chunk_size'],
-                    'chunk_overlap': config['chunking']['chunk_overlap'],
-                    'cache_enabled': True,
-                    'rate_limit_rpm': config['gemini']['rate_limits']['requests_per_minute'],
-                    'rate_limit_rpd': config['gemini']['rate_limits']['requests_per_day']
-                }
+                config_dict = build_apci_config_dict(config)
                 
                 # Creează sistemul APCI
                 st.session_state.apci_system = create_apci_system(api_key, config_dict)
@@ -475,6 +724,9 @@ def process_documents(uploaded_files, api_key: str):
         
         file_paths = []
         doc_ids = []
+        metadata_by_path = {}
+        unique_paths = set()
+        target_collection = normalize_collection_name(target_collection)
         
         with st.spinner("💾 Salvez documentele..."):
             for uploaded_file in uploaded_files:
@@ -483,27 +735,58 @@ def process_documents(uploaded_files, api_key: str):
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 
-                file_paths.append(str(file_path))
                 st.write(f"✅ Salvat: {uploaded_file.name}")
                 
                 # Adaugă în biblioteca de documente
                 if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
                     doc_id = st.session_state.document_manager.add_document(
                         str(file_path),
-                        collection="default",
+                        collection=target_collection,
                         description=f"Încărcat la {time.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                     if doc_id:
                         doc_ids.append(doc_id)
-                        st.write(f"📚 Adăugat în bibliotecă: {uploaded_file.name}")
+                        doc_info = st.session_state.document_manager.get_document_info(doc_id)
+                        library_file_path = st.session_state.document_manager.get_document_file_path(doc_id)
+
+                        if library_file_path and doc_info:
+                            resolved_path = str(library_file_path.resolve())
+                            if resolved_path not in unique_paths:
+                                unique_paths.add(resolved_path)
+                                file_paths.append(resolved_path)
+                            metadata_by_path[resolved_path] = build_metadata_entry(
+                                doc_id,
+                                doc_info,
+                                library_file_path
+                            )
+                            st.write(f"📚 Adăugat în bibliotecă: {doc_info.get('original_name', uploaded_file.name)}")
+                else:
+                    resolved_path = str(file_path.resolve())
+                    if resolved_path not in unique_paths:
+                        unique_paths.add(resolved_path)
+                        file_paths.append(resolved_path)
+                    metadata_by_path[resolved_path] = {
+                        "filename": uploaded_file.name,
+                        "file_type": Path(uploaded_file.name).suffix,
+                        "collection": target_collection,
+                        "source_scope": "general" if is_general_collection(target_collection) else "topic",
+                        "source_path": resolved_path
+                    }
+        
+        if not file_paths:
+            st.error("❌ Nu există documente valide pentru procesare")
+            return
         
         # Procesează documentele
         with st.spinner("🧠 Procesez și indexez documentele..."):
-            success = st.session_state.apci_system.load_documents(file_paths)
+            success = st.session_state.apci_system.load_documents(
+                file_paths,
+                metadata_by_path=metadata_by_path
+            )
             
             if success:
                 st.session_state.documents_loaded = True
-                st.success(f"✅ {len(uploaded_files)} documente procesate cu succes!")
+                st.success(f"✅ {len(file_paths)} documente procesate cu succes!")
                 
                 # Marchează documentele ca indexate în bibliotecă
                 if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
@@ -531,18 +814,7 @@ def load_documents_from_library(doc_ids: List[str], api_key: str):
             with st.spinner("🔄 Inițializez sistemul APCI..."):
                 # Configurație pentru sistem - folosește configurația globală
                 config = load_config()
-                config_dict = {
-                    'model_name': config['models']['primary_llm'],
-                    'fallback_model': config['models']['fallback_llm'],
-                    'temperature': config['gemini']['temperature'],
-                    'max_tokens': config['gemini']['max_tokens'],  # Now 65536
-                    'max_context_docs': config['chunking']['max_context_docs'],
-                    'chunk_size': config['chunking']['chunk_size'],
-                    'chunk_overlap': config['chunking']['chunk_overlap'],
-                    'cache_enabled': True,
-                    'rate_limit_rpm': config['gemini']['rate_limits']['requests_per_minute'],
-                    'rate_limit_rpd': config['gemini']['rate_limits']['requests_per_day']
-                }
+                config_dict = build_apci_config_dict(config)
                 
                 # Creează sistemul APCI
                 st.session_state.apci_system = create_apci_system(api_key, config_dict)
@@ -552,6 +824,8 @@ def load_documents_from_library(doc_ids: List[str], api_key: str):
         # Obține căile fișierelor din bibliotecă
         file_paths = []
         doc_names = []
+        metadata_by_path = {}
+        unique_paths = set()
         
         with st.spinner("📚 Încarcă din bibliotecă..."):
             for doc_id in doc_ids:
@@ -559,8 +833,12 @@ def load_documents_from_library(doc_ids: List[str], api_key: str):
                 doc_info = st.session_state.document_manager.get_document_info(doc_id)
                 
                 if file_path and file_path.exists() and doc_info:
-                    file_paths.append(str(file_path))
+                    resolved_path = str(file_path.resolve())
+                    if resolved_path not in unique_paths:
+                        unique_paths.add(resolved_path)
+                        file_paths.append(resolved_path)
                     doc_names.append(doc_info['original_name'])
+                    metadata_by_path[resolved_path] = build_metadata_entry(doc_id, doc_info, file_path)
                     st.write(f"✅ Găsit: {doc_info['original_name']}")
                 else:
                     st.warning(f"⚠️ Documentul {doc_id} nu a fost găsit")
@@ -571,7 +849,10 @@ def load_documents_from_library(doc_ids: List[str], api_key: str):
         
         # Procesează documentele
         with st.spinner("🧠 Procesez și indexez documentele..."):
-            success = st.session_state.apci_system.load_documents(file_paths)
+            success = st.session_state.apci_system.load_documents(
+                file_paths,
+                metadata_by_path=metadata_by_path
+            )
             
             if success:
                 st.session_state.documents_loaded = True
@@ -691,56 +972,106 @@ def main_chat_interface():
         return
     
     st.title("🧠 APCI - Chat")
-    
-    # Afișează istoricul conversației
-    st.subheader("💬 Conversație")
-    
-    # Container pentru chat
-    chat_container = st.container()
-    
-    with chat_container:
-        for i, chat in enumerate(st.session_state.chat_history):
-            with st.chat_message("user"):
-                st.write(chat["question"])
-            
-            with st.chat_message("assistant"):
-                st.write(chat["response"])
-                
-                # Afișează sursele dacă există
-                if chat.get("sources"):
-                    with st.expander("📚 Surse"):
-                        for j, source in enumerate(chat["sources"], 1):
-                            filename = source.get("filename", f"Document {j}")
-                            st.write(f"{j}. **{filename}**")
-                
-                # Informații tehnice
-                if chat.get("response_time"):
-                    response_time = chat["response_time"]
-                    cached = "💾 (cache)" if chat.get("cached") else "🆕 (nou)"
-                    st.caption(f"⏱️ {response_time:.2f}s {cached}")
-    
-    # Input pentru întrebare nouă
-    st.subheader("❓ Pune o întrebare")
-    
-    user_question = st.text_input(
-        "Întrebarea ta:",
-        placeholder="De exemplu: Explică conceptele principale din documentele încărcate...",
-        key="user_input"
+
+    chat_manager = get_chat_manager()
+    active_chat_id = st.session_state.get("active_chat_id", "")
+    active_chat_data = chat_manager.load_session(active_chat_id) if chat_manager and active_chat_id else None
+    if active_chat_data:
+        topic_label = active_chat_data.get("topic_collection") or "fără topic"
+        st.caption(
+            f"Chat activ: **{active_chat_data.get('title', DEFAULT_CHAT_TITLE)}** · "
+            f"Topic: **{topic_label}**"
+        )
+
+    # Configurare mod interogare + topic activ
+    mode_options = list(QUERY_MODE_LABELS.keys())
+    current_mode = st.session_state.get("query_mode", "topic_general")
+    mode_index = mode_options.index(current_mode) if current_mode in mode_options else mode_options.index("topic_general")
+
+    col_mode, col_topic = st.columns([1, 1])
+    with col_mode:
+        query_mode = st.selectbox(
+            "Mod interogare",
+            options=mode_options,
+            index=mode_index,
+            format_func=lambda mode: QUERY_MODE_LABELS.get(mode, mode)
+        )
+    st.session_state.query_mode = query_mode
+
+    topic_collections = []
+    if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
+        collections = st.session_state.document_manager.get_collections()
+        topic_collections = sorted([name for name in collections.keys() if not is_general_collection(name)])
+
+    with col_topic:
+        if query_mode in {"topic", "topic_general"}:
+            if topic_collections:
+                current_topic = st.session_state.get("active_topic_collection", "")
+                default_topic_index = topic_collections.index(current_topic) if current_topic in topic_collections else 0
+                selected_topic = st.selectbox(
+                    "Topic activ",
+                    options=topic_collections,
+                    index=default_topic_index,
+                    help="Topicul folosit pentru filtrarea documentelor tematice."
+                )
+                st.session_state.active_topic_collection = selected_topic
+            else:
+                st.session_state.active_topic_collection = ""
+                st.warning("Nu există colecții tematice. Creează un topic prin încărcare într-o colecție nouă.")
+
+    persist_active_chat_state(
+        topic_collection=st.session_state.get("active_topic_collection", ""),
+        query_mode=st.session_state.get("query_mode", "topic_general"),
     )
-    
-    col1, col2, col3 = st.columns([1, 1, 2])
-    
-    with col1:
-        ask_button = st.button("🚀 Întreabă", type="primary")
-    
-    with col2:
-        if st.button("🗑️ Curăță Chat"):
+
+    col_actions1, _ = st.columns([1, 2])
+    with col_actions1:
+        if st.button("🗑️ Curăță chat activ", use_container_width=True):
             st.session_state.chat_history = []
+            if chat_manager and active_chat_id:
+                chat_manager.clear_session(active_chat_id)
             st.rerun()
-    
-    # Procesează întrebarea
-    if ask_button and user_question.strip():
-        process_question(user_question)
+
+    st.subheader("💬 Conversație")
+    if not st.session_state.chat_history:
+        st.info("Chatul este gol. Pune prima întrebare pentru acest topic.")
+
+    for chat in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.write(chat["question"])
+
+        with st.chat_message("assistant"):
+            st.write(chat["response"])
+
+            answer_origin = chat.get("answer_origin", "internal")
+            if answer_origin == "external":
+                st.warning("Răspuns extern: sursele interne au fost insuficiente.")
+
+            if chat.get("sources"):
+                with st.expander("📚 Surse"):
+                    for j, source in enumerate(chat["sources"], 1):
+                        filename = source.get("filename", f"Document {j}")
+                        collection = source.get("collection", GENERAL_COLLECTION_NAME)
+                        st.write(f"{j}. **{filename}** ({collection})")
+
+            if chat.get("external_sources"):
+                with st.expander("🌐 Surse Externe"):
+                    for j, source in enumerate(chat["external_sources"], 1):
+                        title = source.get("title", f"Sursă externă {j}")
+                        url = source.get("url", "")
+                        if url:
+                            st.markdown(f"{j}. [{title}]({url})")
+                        else:
+                            st.write(f"{j}. {title}")
+
+            if chat.get("response_time"):
+                response_time = chat["response_time"]
+                cached = "💾 (cache)" if chat.get("cached") else "🆕 (nou)"
+                st.caption(f"⏱️ {response_time:.2f}s {cached}")
+
+    user_question = st.chat_input("Pune o întrebare despre sursele tale...")
+    if user_question and user_question.strip():
+        process_question(user_question.strip())
 
 def library_interface():
     """Interfața pentru biblioteca de documente"""
@@ -1045,16 +1376,27 @@ def show_search_interface():
             st.info(f"❌ Nu s-au găsit documente pentru '{search_query}'")
 
 def main_interface():
-    """Interfața principală cu tabs"""
-    # Tabs principale
-    if DOCUMENT_MANAGER_AVAILABLE:
-        tab1, tab2 = st.tabs(["💬 Chat", "📚 Biblioteca"])
-        
-        with tab1:
-            main_chat_interface()
-        
-        with tab2:
-            library_interface()
+    """Interfața principală simplificată."""
+    if not DOCUMENT_MANAGER_AVAILABLE:
+        main_chat_interface()
+        return
+
+    nav_options = ["💬 Chat", "📚 Biblioteca"]
+    current_tab = st.session_state.get("current_tab", "💬 Chat")
+    if current_tab not in nav_options:
+        current_tab = "💬 Chat"
+
+    selected_tab = st.radio(
+        "Navigare",
+        options=nav_options,
+        index=nav_options.index(current_tab),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.session_state.current_tab = selected_tab
+
+    if selected_tab == "📚 Biblioteca":
+        library_interface()
     else:
         main_chat_interface()
 
@@ -1065,7 +1407,12 @@ def process_question(question: str):
             start_time = time.time()
             
             # Obține răspunsul de la APCI
-            result = st.session_state.apci_system.query(question)
+            result = st.session_state.apci_system.query(
+                question,
+                retrieval_mode=st.session_state.get("query_mode", "topic_general"),
+                active_collection=st.session_state.get("active_topic_collection", "") or None,
+                general_collection=GENERAL_COLLECTION_NAME
+            )
             
             end_time = time.time()
             
@@ -1074,13 +1421,29 @@ def process_question(question: str):
                 "question": question,
                 "response": result.get("response", "Nu am putut genera un răspuns."),
                 "sources": result.get("sources", []),
+                "external_sources": result.get("external_sources", []),
                 "response_time": result.get("response_time", end_time - start_time),
                 "cached": result.get("cached", False),
-                "model_used": result.get("model_used", "Unknown")
+                "model_used": result.get("model_used", "Unknown"),
+                "answer_origin": result.get("answer_origin", "internal"),
+                "retrieval_mode": result.get("retrieval_mode", st.session_state.get("query_mode", "topic_general"))
             }
             
             st.session_state.chat_history.append(chat_entry)
-            
+
+            chat_manager = get_chat_manager()
+            active_chat_id = st.session_state.get("active_chat_id", "")
+            if chat_manager and active_chat_id:
+                chat_manager.append_exchange(active_chat_id, chat_entry)
+                persisted_chat = chat_manager.load_session(active_chat_id) or {}
+                st.session_state.chat_title_draft = persisted_chat.get("title", DEFAULT_CHAT_TITLE)
+                chat_manager.save_session(
+                    active_chat_id,
+                    persisted_chat.get("messages", []),
+                    topic_collection=st.session_state.get("active_topic_collection", ""),
+                    query_mode=st.session_state.get("query_mode", "topic_general"),
+                )
+             
             # Actualizează statusul
             update_system_status()
             
@@ -1154,13 +1517,15 @@ def check_api_key_setup():
                                 os.environ['GOOGLE_API_KEY'] = api_key_input
                                 
                                 # Testează conexiunea
-                                import google.generativeai as genai
-                                genai.configure(api_key=api_key_input)
-                                
-                                model = genai.GenerativeModel('gemini-2.5-flash')
-                                response = model.generate_content("Spune doar 'Test reușit!'")
-                                
-                                if response.text:
+                                from google import genai
+                                client = genai.Client(api_key=api_key_input)
+
+                                response = client.models.generate_content(
+                                    model="gemini-2.5-flash",
+                                    contents="Spune doar 'Test reușit!'"
+                                )
+
+                                if response and getattr(response, "text", ""):
                                     st.success("✅ Conexiunea funcționează!")
                                 else:
                                     st.error("❌ Test eșuat - verifică API key-ul")

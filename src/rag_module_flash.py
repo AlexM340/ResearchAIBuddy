@@ -11,20 +11,27 @@ from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import requests
 
 try:
-    import google.generativeai as genai
+    from google import genai
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
-    print("Google Generative AI nu este disponibil")
+    print("Google GenAI SDK nu este disponibil")
 
 try:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain_community.document_loaders import PyPDFLoader, TextLoader
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import FAISS
-    from langchain.docstore.document import Document
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError:
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+    from langchain_community.document_loaders import PyPDFLoader
+
+    try:
+        from langchain_core.documents import Document
+    except ImportError:
+        from langchain.docstore.document import Document
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
@@ -79,6 +86,10 @@ class RAGConfig:
     cache_enabled: bool = True
     rate_limit_rpm: int = 30
     rate_limit_rpd: int = 3000
+    retrieval_candidates: int = 20
+    rerank_top_k: int = 8
+    neighbor_window: int = 1
+    hybrid_alpha: float = 0.7
 
 class GeminiRateLimiter:
     """Rate limiter optimizat pentru Gemini Flash"""
@@ -285,7 +296,7 @@ class PersistentEmbeddingsCache:
             return [], None, False
         
         cached_documents = []
-        cached_embeddings = []
+        cached_embeddings = None
         new_files = []
         
         for file_path in file_paths:
@@ -298,14 +309,30 @@ class PersistentEmbeddingsCache:
                 file_key in self.documents_cache and
                 file_key in self.embeddings_cache):
                 
-                cached_documents.extend(self.documents_cache[file_key])
-                if cached_embeddings == []:
-                    cached_embeddings = self.embeddings_cache[file_key]
+                file_cached_documents = self.documents_cache[file_key]
+                file_cached_embeddings = self.embeddings_cache[file_key]
+
+                if NUMPY_AVAILABLE and hasattr(file_cached_embeddings, "shape"):
+                    cached_count = int(file_cached_embeddings.shape[0]) if len(file_cached_embeddings.shape) > 0 else 0
+                else:
+                    cached_count = len(file_cached_embeddings) if hasattr(file_cached_embeddings, "__len__") else 0
+
+                if cached_count != len(file_cached_documents):
+                    logger.warning(
+                        f"Cache invalid pentru {Path(file_path).name}: "
+                        f"{len(file_cached_documents)} docs vs {cached_count} embeddings. Regenerez fișierul."
+                    )
+                    new_files.append(file_path)
+                    continue
+
+                cached_documents.extend(file_cached_documents)
+                if cached_embeddings is None:
+                    cached_embeddings = file_cached_embeddings
                 else:
                     if NUMPY_AVAILABLE:
-                        cached_embeddings = np.vstack([cached_embeddings, self.embeddings_cache[file_key]])
+                        cached_embeddings = np.vstack([cached_embeddings, file_cached_embeddings])
                     else:
-                        cached_embeddings.extend(self.embeddings_cache[file_key])
+                        cached_embeddings.extend(file_cached_embeddings)
                         
                 logger.info(f"Cache hit pentru: {Path(file_path).name}")
             else:
@@ -333,7 +360,13 @@ class PersistentEmbeddingsCache:
             file_hash = self._calculate_file_hash(file_path)
             
             # Găsește documentele pentru acest fișier
-            file_docs = [doc for doc in documents if doc.get('source', '') == file_path]
+            file_docs = []
+            for doc in documents:
+                source_path = doc.get('metadata', {}).get('source_path', '')
+                if not source_path:
+                    continue
+                if str(Path(source_path).resolve()) == file_key:
+                    file_docs.append(doc)
             doc_count = len(file_docs)
             
             if doc_count > 0:
@@ -402,52 +435,59 @@ class OptimizedFlashLLM:
     
     def __init__(self, config: RAGConfig, api_key: str):
         if not GENAI_AVAILABLE:
-            raise ImportError("Google Generative AI nu este disponibil")
+            raise ImportError("Google GenAI SDK nu este disponibil")
             
         self.config = config
         self.api_key = api_key
         
-        # Configurare Gemini
-        genai.configure(api_key=api_key)
+        # Inițializează clientul Gemini (SDK nou)
+        self.client = genai.Client(api_key=api_key)
         
         # Detectează modelul disponibil
         self.model_name = self._detect_best_model()
         
         # Configurare generare
-        self.generation_config = genai.types.GenerationConfig(
+        self.generation_config = genai.types.GenerateContentConfig(
             temperature=config.temperature,
             max_output_tokens=config.max_tokens,
         )
         
-        # Inițializare model
-        self.model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config=self.generation_config
-        )
-        
         logger.info(f"OptimizedFlashLLM inițializat cu {self.model_name}")
     
+    @staticmethod
+    def _normalize_model_name(model_name: str) -> str:
+        if model_name.startswith("models/"):
+            return model_name.split("/", 1)[1]
+        return model_name
+
     def _detect_best_model(self) -> str:
         """Detectează cel mai bun model disponibil"""
         try:
-            available_models = [m.name for m in genai.list_models()]
+            available_models = list(self.client.models.list())
+            normalized_available = {
+                self._normalize_model_name(model.name)
+                for model in available_models
+                if getattr(model, "name", "")
+            }
             
             # Prioritatea modelelor
             preferred_models = [
-                "models/gemini-2.5-flash",
-                "models/gemini-2.5-flash-preview-05-20", 
-                "models/gemini-2.0-flash-exp",
-                "models/gemini-2.0-flash",
-                "models/gemini-1.5-flash"
+                self.config.model_name,
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-preview-05-20", 
+                "gemini-2.0-flash-exp",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash"
             ]
             
             for model in preferred_models:
-                if model in available_models:
-                    logger.info(f"Model detectat: {model}")
-                    return model
+                normalized_model = self._normalize_model_name(model)
+                if normalized_model in normalized_available:
+                    logger.info(f"Model detectat: {normalized_model}")
+                    return normalized_model
             
             # Fallback la primul model Flash disponibil
-            flash_models = [m for m in available_models if "flash" in m.lower()]
+            flash_models = sorted([m for m in normalized_available if "flash" in m.lower()])
             if flash_models:
                 logger.warning(f"Folosesc fallback model: {flash_models[0]}")
                 return flash_models[0]
@@ -456,16 +496,21 @@ class OptimizedFlashLLM:
             
         except Exception as e:
             logger.error(f"Eroare la detectarea modelului: {e}")
-            return self.config.fallback_model
+            return self._normalize_model_name(self.config.fallback_model)
     
     def generate(self, prompt: str, max_retries: int = 3) -> str:
         """Generează răspuns cu retry logic"""
         for attempt in range(max_retries):
             try:
-                response = self.model.generate_content(prompt)
-                
-                if response.text:
-                    return response.text.strip()
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=self.generation_config
+                )
+
+                response_text = (response.text or "").strip() if response else ""
+                if response_text:
+                    return response_text
                 else:
                     raise Exception("Răspuns gol de la model")
                     
@@ -500,12 +545,19 @@ class SimpleDocumentProcessor:
         else:
             self.text_splitter = None
     
-    def load_documents(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+    def load_documents(
+        self,
+        file_paths: List[str],
+        metadata_by_path: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> List[Dict[str, Any]]:
         """Încarcă documente din fișiere"""
         documents = []
+        metadata_by_path = metadata_by_path or {}
         
         for file_path in file_paths:
             file_path = Path(file_path)
+            resolved_path = str(file_path.resolve())
+            extra_metadata = metadata_by_path.get(resolved_path, {})
             
             try:
                 text_content = ""
@@ -528,16 +580,19 @@ class SimpleDocumentProcessor:
                     continue
                 
                 if text_content.strip():
+                    filename = extra_metadata.get('filename', file_path.name)
                     doc = {
                         'content': text_content,
                         'metadata': {
-                            'filename': file_path.name,
+                            'filename': filename,
                             'file_type': file_path.suffix,
-                            'source_path': str(file_path)
+                            'source_path': resolved_path,
+                            **extra_metadata
                         }
                     }
+                    doc['metadata']['source_path'] = resolved_path
                     documents.append(doc)
-                    logger.info(f"Încărcat {file_path.name}")
+                    logger.info(f"Încărcat {filename}")
                 
             except Exception as e:
                 logger.error(f"Eroare la încărcarea {file_path}: {e}")
@@ -560,13 +615,17 @@ class SimpleDocumentProcessor:
                 # Folosește LangChain text splitter
                 lang_doc = Document(page_content=content, metadata=metadata)
                 doc_chunks = self.text_splitter.split_documents([lang_doc])
+                chunk_counter = 0
                 
                 for chunk in doc_chunks:
                     if len(chunk.page_content.strip()) > 50:
+                        chunk_metadata = dict(chunk.metadata)
+                        chunk_metadata["chunk_id"] = chunk_counter
                         chunks.append({
                             'content': chunk.page_content,
-                            'metadata': chunk.metadata
+                            'metadata': chunk_metadata
                         })
+                        chunk_counter += 1
             else:
                 # Chunking simplu manual
                 chunk_size = self.config.chunk_size
@@ -604,6 +663,7 @@ class SimpleRetriever:
         self.documents = []
         self.embeddings_model = None
         self.document_embeddings = []
+        self.chunk_lookup = {}
         
         # Inițializare cache persistent
         self.embeddings_cache = PersistentEmbeddingsCache()
@@ -615,6 +675,22 @@ class SimpleRetriever:
                 logger.info(f"Model embeddings încărcat: {config.embedding_model}")
             except Exception as e:
                 logger.warning(f"Nu s-a putut încărca modelul embeddings: {e}")
+
+    def _rebuild_chunk_lookup(self):
+        """Construiește un index rapid (source_path, chunk_id) -> doc_index."""
+        self.chunk_lookup = {}
+        for idx, doc in enumerate(self.documents):
+            metadata = doc.get("metadata", {})
+            source_path = metadata.get("source_path")
+            chunk_id = metadata.get("chunk_id")
+            if source_path is None or chunk_id is None:
+                continue
+            try:
+                normalized_source = str(Path(source_path).resolve())
+                normalized_chunk_id = int(chunk_id)
+                self.chunk_lookup[(normalized_source, normalized_chunk_id)] = idx
+            except Exception:
+                continue
     
     def build_index_with_cache(self, file_paths: List[str], documents: List[Dict[str, Any]]):
         """Construiește indexul cu cache persistent - optimizat pentru viteză"""
@@ -652,7 +728,7 @@ class SimpleRetriever:
                 logger.info(f"Încărcat instant din cache: {len(new_cached_docs)} documente")
             else:
                 logger.info("Toate documentele din cache sunt deja încărcate")
-            
+            self._rebuild_chunk_lookup()
             return
         
         # Cache parțial sau lipsă - procesare necesară
@@ -707,7 +783,7 @@ class SimpleRetriever:
                     logger.info(f"Generat embeddings pentru {len(new_docs)} documente noi")
                     
                     # Salvează în cache pentru viitorul utilizări
-                    self.embeddings_cache.save_embeddings(file_paths, documents, self.document_embeddings)
+                    self.embeddings_cache.save_embeddings(file_paths, new_docs, new_embeddings)
                     
                 except Exception as e:
                     logger.error(f"Eroare la generarea embeddings: {e}")
@@ -715,6 +791,7 @@ class SimpleRetriever:
         else:
             logger.info("Toate documentele sunt deja în index")
         
+        self._rebuild_chunk_lookup()
         logger.info(f"Index finalizat cu {len(self.documents)} documente totale")
     
     def build_index(self, documents: List[Dict[str, Any]]):
@@ -762,70 +839,185 @@ class SimpleRetriever:
                 logger.error(f"Eroare la generarea embeddings: {e}")
                 self.document_embeddings = []
         
+        self._rebuild_chunk_lookup()
         logger.info(f"Index actualizat cu {len(self.documents)} documente totale")
     
-    def retrieve(self, query: str, k: int = None) -> List[Dict[str, Any]]:
-        """Regăsește documente relevante"""
+    def retrieve(
+        self,
+        query: str,
+        k: int = None,
+        filter_fn: Optional[Any] = None
+    ) -> List[Dict[str, Any]]:
+        """Regăsește documente relevante cu scoring hibrid și extindere pe vecini."""
         if not self.documents:
             logger.warning("Nu există documente indexate")
             return []
         
         k = k or self.config.max_context_docs
+        candidate_indices = list(range(len(self.documents)))
+        if filter_fn:
+            candidate_indices = [
+                idx for idx, doc in enumerate(self.documents) if filter_fn(doc)
+            ]
         
-        if self.embeddings_model and len(self.document_embeddings) > 0:
-            # Căutare semantică cu embeddings
-            return self._semantic_search(query, k)
-        else:
-            # Căutare simplă pe bază de cuvinte cheie
-            return self._keyword_search(query, k)
-    
-    def _semantic_search(self, query: str, k: int) -> List[Dict[str, Any]]:
-        """Căutare semantică cu embeddings"""
+        if not candidate_indices:
+            logger.info("Nu există documente candidate pentru filtrul curent")
+            return []
+
+        semantic_scores = self._compute_semantic_scores(query, candidate_indices)
+        keyword_scores = self._compute_keyword_scores(query, candidate_indices)
+
+        semantic_norm = self._normalize_scores(semantic_scores, candidate_indices)
+        keyword_norm = self._normalize_scores(keyword_scores, candidate_indices)
+
+        has_semantic = bool(semantic_scores)
+        alpha = self.config.hybrid_alpha if has_semantic else 0.0
+        alpha = max(0.0, min(alpha, 1.0))
+
+        hybrid_scores = {}
+        for idx in candidate_indices:
+            hybrid_scores[idx] = (
+                alpha * semantic_norm.get(idx, 0.0)
+                + (1.0 - alpha) * keyword_norm.get(idx, 0.0)
+            )
+
+        candidate_pool = max(k, self.config.retrieval_candidates)
+        candidate_pool = min(candidate_pool, len(candidate_indices))
+        ranked_candidates = sorted(
+            candidate_indices,
+            key=lambda idx: hybrid_scores.get(idx, 0.0),
+            reverse=True
+        )[:candidate_pool]
+
+        seed_k = max(k, self.config.rerank_top_k)
+        seed_k = min(seed_k, len(ranked_candidates))
+        seed_indices = ranked_candidates[:seed_k]
+
+        expanded_scores = self._expand_with_neighbors(seed_indices, hybrid_scores, candidate_indices)
+        final_indices = sorted(
+            expanded_scores.keys(),
+            key=lambda idx: expanded_scores.get(idx, 0.0),
+            reverse=True
+        )[:k]
+
+        results = []
+        for idx in final_indices:
+            doc = self.documents[idx]
+            results.append({
+                "content": doc["content"],
+                "metadata": doc.get("metadata", {}).copy(),
+                "retrieval_score": float(expanded_scores.get(idx, 0.0)),
+                "semantic_score": float(semantic_norm.get(idx, 0.0)),
+                "keyword_score": float(keyword_norm.get(idx, 0.0))
+            })
+
+        return results
+
+    @staticmethod
+    def _normalize_scores(score_map: Dict[int, float], candidate_indices: List[int]) -> Dict[int, float]:
+        if not candidate_indices:
+            return {}
+
+        values = [float(score_map.get(idx, 0.0)) for idx in candidate_indices]
+        if not values:
+            return {idx: 0.0 for idx in candidate_indices}
+
+        minimum = min(values)
+        maximum = max(values)
+        if abs(maximum - minimum) < 1e-9:
+            return {idx: 1.0 if score_map.get(idx, 0.0) > 0 else 0.0 for idx in candidate_indices}
+
+        return {
+            idx: (float(score_map.get(idx, 0.0)) - minimum) / (maximum - minimum)
+            for idx in candidate_indices
+        }
+
+    def _compute_semantic_scores(self, query: str, candidate_indices: List[int]) -> Dict[int, float]:
+        if not (
+            self.embeddings_model
+            and len(self.document_embeddings) > 0
+            and len(self.document_embeddings) == len(self.documents)
+        ):
+            return {}
+
         try:
-            # Generează embedding pentru query
             query_embedding = self.embeddings_model.encode([query])
-            
-            # Calculează similaritatea
+
             if NUMPY_AVAILABLE:
-                similarities = np.dot(self.document_embeddings, query_embedding.T).flatten()
-                top_indices = np.argsort(similarities)[::-1][:k]
+                if hasattr(self.document_embeddings, "shape"):
+                    candidate_embeddings = self.document_embeddings[candidate_indices]
+                else:
+                    candidate_embeddings = np.array([self.document_embeddings[idx] for idx in candidate_indices])
+                similarities = np.dot(candidate_embeddings, query_embedding.T).flatten()
             else:
-                # Fallback fără numpy
                 similarities = []
-                for doc_emb in self.document_embeddings:
+                for index in candidate_indices:
+                    doc_emb = self.document_embeddings[index]
                     sim = sum(a * b for a, b in zip(doc_emb, query_embedding[0]))
                     similarities.append(sim)
-                
-                # Sortează și ia top k
-                indexed_sims = list(enumerate(similarities))
-                indexed_sims.sort(key=lambda x: x[1], reverse=True)
-                top_indices = [idx for idx, _ in indexed_sims[:k]]
-            
-            return [self.documents[i] for i in top_indices]
-            
+
+            return {
+                candidate_indices[position]: float(score)
+                for position, score in enumerate(similarities)
+            }
         except Exception as e:
-            logger.error(f"Eroare la căutarea semantică: {e}")
-            return self._keyword_search(query, k)
-    
-    def _keyword_search(self, query: str, k: int) -> List[Dict[str, Any]]:
-        """Căutare simplă pe bază de cuvinte cheie"""
+            logger.error(f"Eroare la scor semantic: {e}")
+            return {}
+
+    def _compute_keyword_scores(self, query: str, candidate_indices: List[int]) -> Dict[int, float]:
         query_words = set(query.lower().split())
-        
-        scored_docs = []
-        for doc in self.documents:
+        if not query_words:
+            return {idx: 0.0 for idx in candidate_indices}
+
+        scores = {}
+        for index in candidate_indices:
+            doc = self.documents[index]
             content_words = set(doc['content'].lower().split())
-            
-            # Scor bazat pe intersecția cuvintelor
             word_overlap = len(query_words.intersection(content_words))
-            length_score = min(len(doc['content']) / 1000, 1.0)
-            
-            total_score = word_overlap + length_score
-            scored_docs.append((total_score, doc))
-        
-        # Sortează după scor
-        scored_docs.sort(key=lambda x: x[0], reverse=True)
-        
-        return [doc for _, doc in scored_docs[:k]]
+            density_score = word_overlap / max(len(query_words), 1)
+            length_penalty = min(len(doc['content']) / 2000.0, 1.0)
+            scores[index] = float(density_score + 0.15 * length_penalty)
+        return scores
+
+    def _expand_with_neighbors(
+        self,
+        seed_indices: List[int],
+        base_scores: Dict[int, float],
+        candidate_indices: List[int]
+    ) -> Dict[int, float]:
+        expanded_scores = {idx: float(base_scores.get(idx, 0.0)) for idx in seed_indices}
+        candidate_set = set(candidate_indices)
+        window = max(0, int(self.config.neighbor_window))
+        if window == 0:
+            return expanded_scores
+
+        for seed_idx in seed_indices:
+            seed_doc = self.documents[seed_idx]
+            seed_meta = seed_doc.get("metadata", {})
+            source_path = seed_meta.get("source_path")
+            chunk_id = seed_meta.get("chunk_id")
+            if source_path is None or chunk_id is None:
+                continue
+
+            try:
+                normalized_source = str(Path(source_path).resolve())
+                normalized_chunk_id = int(chunk_id)
+            except Exception:
+                continue
+
+            seed_score = float(base_scores.get(seed_idx, 0.0))
+            for offset in range(1, window + 1):
+                for neighbor_chunk_id in (normalized_chunk_id - offset, normalized_chunk_id + offset):
+                    neighbor_idx = self.chunk_lookup.get((normalized_source, neighbor_chunk_id))
+                    if neighbor_idx is None or neighbor_idx not in candidate_set:
+                        continue
+                    neighbor_base = float(base_scores.get(neighbor_idx, 0.0))
+                    boosted_score = max(neighbor_base, seed_score * (1.0 - 0.08 * offset))
+                    previous = expanded_scores.get(neighbor_idx, -1.0)
+                    if boosted_score > previous:
+                        expanded_scores[neighbor_idx] = boosted_score
+
+        return expanded_scores
 
 class APCISystem:
     """Sistemul principal APCI cu toate optimizările"""
@@ -869,13 +1061,21 @@ class APCISystem:
         
         logger.info("APCISystem inițializat cu succes")
     
-    def load_documents(self, file_paths: List[str]) -> bool:
+    def load_documents(
+        self,
+        file_paths: List[str],
+        metadata_by_path: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> bool:
         """Încarcă și indexează documente cu cache persistent pentru viteză optimă"""
         try:
             start_time = time.time()
+            resolved_file_paths = [str(Path(path).resolve()) for path in file_paths]
             
             # Încarcă documente
-            documents = self.document_processor.load_documents(file_paths)
+            documents = self.document_processor.load_documents(
+                resolved_file_paths,
+                metadata_by_path=metadata_by_path
+            )
             if not documents:
                 logger.warning("Nu s-au încărcat documente")
                 return False
@@ -887,7 +1087,7 @@ class APCISystem:
                 return False
             
             # Construiește index cu cache persistent - aceasta este optimizarea cheie!
-            self.retriever.build_index_with_cache(file_paths, processed_docs)
+            self.retriever.build_index_with_cache(resolved_file_paths, processed_docs)
             
             self.stats["documents_indexed"] = len(processed_docs)
             
@@ -906,7 +1106,8 @@ class APCISystem:
         """Încarcă și indexează documente - versiunea originală fără cache"""
         try:
             # Încarcă documente
-            documents = self.document_processor.load_documents(file_paths)
+            resolved_file_paths = [str(Path(path).resolve()) for path in file_paths]
+            documents = self.document_processor.load_documents(resolved_file_paths)
             if not documents:
                 logger.warning("Nu s-au încărcat documente")
                 return False
@@ -936,7 +1137,8 @@ class APCISystem:
 
 Întrebare: {query}
 
-Răspunde concis și informativ, oferind informații relevante și practice. Limitează răspunsul la maximum 3 paragrafe.
+Dacă nu ai context suficient, răspunde exact: INSUFFICIENT_CONTEXT.
+În caz contrar, răspunde concis și informativ, oferind informații relevante și practice.
 
 Răspuns:"""
         
@@ -960,19 +1162,195 @@ CONTEXT:
 INSTRUCȚIUNI:
 - Răspunde pe baza contextului furnizat
 - Citează sursele relevante [număr]
-- Fii concis dar complet (max 4 paragrafe)
-- Dacă contextul e insuficient, menționează acest lucru
+- Dacă contextul este insuficient, răspunde exact: INSUFFICIENT_CONTEXT
 
 RĂSPUNS:"""
     
-    def query(self, question: str) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_collection_name(name: Optional[str]) -> str:
+        return (name or "").strip().lower()
+
+    def _is_general_collection(self, collection_name: Optional[str], general_collection: str) -> bool:
+        normalized = self._normalize_collection_name(collection_name)
+        general_aliases = {"general", "default", self._normalize_collection_name(general_collection)}
+        return normalized in general_aliases
+
+    def _build_scope_filter(
+        self,
+        retrieval_mode: str,
+        active_collection: Optional[str],
+        general_collection: str
+    ):
+        normalized_mode = (retrieval_mode or "topic_general").strip().lower()
+        normalized_active = self._normalize_collection_name(active_collection)
+
+        if normalized_mode == "all":
+            return None
+
+        if normalized_mode == "topic":
+            if not normalized_active:
+                return lambda _: False
+            return lambda doc: self._normalize_collection_name(
+                doc.get("metadata", {}).get("collection", "general")
+            ) == normalized_active
+
+        if normalized_mode == "topic_general":
+            if not normalized_active:
+                return lambda doc: self._is_general_collection(
+                    doc.get("metadata", {}).get("collection", "general"),
+                    general_collection
+                )
+            return lambda doc: (
+                self._normalize_collection_name(doc.get("metadata", {}).get("collection", "general"))
+                == normalized_active
+                or self._is_general_collection(
+                    doc.get("metadata", {}).get("collection", "general"),
+                    general_collection
+                )
+            )
+
+        return None
+
+    @staticmethod
+    def _is_insufficient_response(response: str) -> bool:
+        response_text = (response or "").strip().upper()
+        return response_text.startswith("INSUFFICIENT_CONTEXT")
+
+    def _fetch_external_sources(self, question: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
+        if not tavily_api_key:
+            return []
+
+        payload = {
+            "api_key": tavily_api_key,
+            "query": question,
+            "max_results": max_results,
+            "search_depth": "advanced",
+            "include_answer": False
+        }
+
+        try:
+            response = requests.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                timeout=20
+            )
+            response.raise_for_status()
+            data = response.json()
+            sources = []
+            for item in data.get("results", []):
+                sources.append({
+                    "title": item.get("title", "Sursă externă"),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("content", "")
+                })
+            return sources
+        except Exception as e:
+            logger.warning(f"Nu s-au putut obține surse externe: {e}")
+            return []
+
+    def _create_external_prompt(self, question: str, external_sources: List[Dict[str, Any]]) -> str:
+        if not external_sources:
+            return f"""Ești APCI. Nu există surse interne suficiente pentru această întrebare.
+
+ÎNTREBARE: {question}
+
+INSTRUCȚIUNI:
+- Oferă un răspuns general bazat pe cunoștințe externe ale modelului.
+- Menționează explicit că răspunsul nu este fundamentat în sursele locale.
+- Formulează răspunsul în română, concis și practic.
+"""
+
+        source_blocks = []
+        for idx, source in enumerate(external_sources, 1):
+            title = source.get("title", f"Sursa {idx}")
+            url = source.get("url", "")
+            snippet = source.get("snippet", "")
+            snippet_preview = snippet[:600] + "..." if len(snippet) > 600 else snippet
+            source_blocks.append(
+                f"[E{idx}] {title}\nURL: {url}\nRezumat: {snippet_preview}"
+            )
+
+        sources_text = "\n\n".join(source_blocks)
+        return f"""Ești APCI. Sursele interne sunt insuficiente, folosește doar sursele externe de mai jos.
+
+SURSE EXTERNE:
+{sources_text}
+
+ÎNTREBARE: {question}
+
+INSTRUCȚIUNI:
+- Răspunde strict pe baza surselor externe de mai sus.
+- Marchează citările cu formatul [E1], [E2], etc.
+- Dacă sursele externe sunt insuficiente, spune explicit acest lucru.
+- Formulează răspunsul în română, max 4 paragrafe.
+"""
+
+    def _run_external_fallback(
+        self,
+        question: str,
+        start_time: float,
+        retrieval_mode: str,
+        active_collection: Optional[str],
+        reason: str
+    ) -> Dict[str, Any]:
+        external_sources = self._fetch_external_sources(question)
+        external_prompt = self._create_external_prompt(question, external_sources)
+
+        self.rate_limiter.wait_if_needed()
+        self.rate_limiter.add_request()
+        external_response = self.llm.generate(external_prompt)
+        self.stats["llm_calls"] += 1
+
+        response_time = time.time() - start_time
+        self._update_avg_response_time(response_time)
+
+        return {
+            "response": external_response,
+            "sources": [],
+            "external_sources": external_sources,
+            "cached": False,
+            "response_time": response_time,
+            "model_used": self.llm.model_name,
+            "answer_origin": "external",
+            "fallback_reason": reason,
+            "retrieval_mode": retrieval_mode,
+            "active_collection": active_collection
+        }
+
+    def query(
+        self,
+        question: str,
+        retrieval_mode: str = "topic_general",
+        active_collection: Optional[str] = None,
+        general_collection: str = "general"
+    ) -> Dict[str, Any]:
         """Procesează o întrebare și returnează răspunsul"""
         start_time = time.time()
         self.stats["total_queries"] += 1
         
         try:
+            scope_filter = self._build_scope_filter(
+                retrieval_mode,
+                active_collection,
+                general_collection
+            )
+
             # Regăsește context relevant
-            context_docs = self.retriever.retrieve(question, k=self.config.max_context_docs)
+            context_docs = self.retriever.retrieve(
+                question,
+                k=self.config.max_context_docs,
+                filter_fn=scope_filter
+            )
+
+            if not context_docs:
+                return self._run_external_fallback(
+                    question,
+                    start_time,
+                    retrieval_mode,
+                    active_collection,
+                    reason="no_internal_context"
+                )
             
             # Creează prompt
             prompt = self._create_rag_prompt(question, context_docs)
@@ -985,12 +1363,25 @@ RĂSPUNS:"""
                 
                 if cached_response:
                     self.stats["cache_hits"] += 1
+                    if self._is_insufficient_response(cached_response):
+                        return self._run_external_fallback(
+                            question,
+                            start_time,
+                            retrieval_mode,
+                            active_collection,
+                            reason="insufficient_cached_context"
+                        )
+
                     return {
                         "response": cached_response,
                         "sources": [doc['metadata'] for doc in context_docs],
+                        "external_sources": [],
                         "cached": True,
                         "response_time": time.time() - start_time,
-                        "model_used": self.llm.model_name
+                        "model_used": self.llm.model_name,
+                        "answer_origin": "internal",
+                        "retrieval_mode": retrieval_mode,
+                        "active_collection": active_collection
                     }
             
             # Rate limiting
@@ -1005,6 +1396,15 @@ RĂSPUNS:"""
             if self.cache_manager and len(response) > 50:
                 model_settings = self.llm.get_model_info()
                 self.cache_manager.cache_response(prompt, response, model_settings)
+
+            if self._is_insufficient_response(response):
+                return self._run_external_fallback(
+                    question,
+                    start_time,
+                    retrieval_mode,
+                    active_collection,
+                    reason="insufficient_internal_context"
+                )
             
             # Actualizează statistici
             response_time = time.time() - start_time
@@ -1013,10 +1413,14 @@ RĂSPUNS:"""
             return {
                 "response": response,
                 "sources": [doc['metadata'] for doc in context_docs],
+                "external_sources": [],
                 "cached": False,
                 "response_time": response_time,
                 "model_used": self.llm.model_name,
-                "context_docs_count": len(context_docs)
+                "context_docs_count": len(context_docs),
+                "answer_origin": "internal",
+                "retrieval_mode": retrieval_mode,
+                "active_collection": active_collection
             }
             
         except Exception as e:
@@ -1024,9 +1428,11 @@ RĂSPUNS:"""
             return {
                 "response": f"Ne pare rău, a apărut o eroare: {str(e)[:100]}...",
                 "sources": [],
+                "external_sources": [],
                 "cached": False,
                 "response_time": time.time() - start_time,
-                "error": str(e)
+                "error": str(e),
+                "answer_origin": "error"
             }
     
     def _update_avg_response_time(self, new_time: float):
@@ -1049,7 +1455,11 @@ RĂSPUNS:"""
                 "model_name": self.config.model_name,
                 "max_context_docs": self.config.max_context_docs,
                 "cache_enabled": self.config.cache_enabled,
-                "chunk_size": self.config.chunk_size
+                "chunk_size": self.config.chunk_size,
+                "retrieval_candidates": self.config.retrieval_candidates,
+                "rerank_top_k": self.config.rerank_top_k,
+                "neighbor_window": self.config.neighbor_window,
+                "hybrid_alpha": self.config.hybrid_alpha
             },
             "dependencies": {
                 "genai_available": GENAI_AVAILABLE,
