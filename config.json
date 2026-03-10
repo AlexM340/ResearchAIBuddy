@@ -12,6 +12,7 @@
     },
     "gemini": {
         "temperature": 0.1,
+        "max_tokens": 65536,
         "rate_limits": {
             "requests_per_minute": 30,
             "requests_per_day": 3000
@@ -36,6 +37,37 @@
         "use_reranking": true,
         "compression_enabled": true,
         "use_cache": true
+    },
+    "storage": {
+        "postgres_dsn": "",
+        "pgvector_embedding_dim": 384
+    },
+    "graph": {
+        "neo4j_uri": "neo4j+s://b42979c2.databases.neo4j.io",
+        "neo4j_user": "neo4j",
+        "neo4j_password": ""
+    },
+    "second_brain": {
+        "enable_graph_rag": true,
+        "router_mode": "rule_based",
+        "vector_confidence_threshold": 0.35,
+        "context_budget_tokens": 8000,
+        "vector_budget_ratio": 0.65,
+        "graph_budget_ratio": 0.35,
+        "decision_extraction_enabled": true,
+        "graph_max_hops": 2,
+        "graph_min_confidence": 0.7,
+        "graph_extraction_mode": "heuristic_fallback",
+        "memory_consolidation_enabled": true,
+        "memory_decay_days": 90,
+        "db_primary_strict": true,
+        "ingestion_embedding_batch_size": 64,
+        "ingestion_max_workers": 4
+    },
+    "retrieval": {
+        "vector_top_k": 8,
+        "graph_top_k_paths": 6,
+        "hybrid_rerank_top_k": 8
     },
     "agent": {
         "max_iterations": 10,

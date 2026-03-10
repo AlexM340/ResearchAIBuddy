@@ -74,6 +74,8 @@ class ChatSessionManager:
             "created_at": session_data.get("created_at", _now_iso()),
             "updated_at": session_data.get("updated_at", _now_iso()),
             "message_count": len(messages),
+            "migrated_to_db": bool(session_data.get("migrated_to_db", False)),
+            "db_session_id": session_data.get("db_session_id", ""),
         }
 
     def _upsert_index_entry(self, session_data: Dict[str, Any]) -> None:
@@ -102,12 +104,18 @@ class ChatSessionManager:
         self._upsert_index_entry(session_data)
         return self.index["sessions"][session_id]
 
-    def list_sessions(self, topic_collection: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        topic_collection: Optional[str] = None,
+        include_migrated: bool = True,
+    ) -> List[Dict[str, Any]]:
         sessions = list(self.index.get("sessions", {}).values())
         if topic_collection is not None:
             sessions = [
                 item for item in sessions if item.get("topic_collection", "") == topic_collection
             ]
+        if not include_migrated:
+            sessions = [item for item in sessions if not item.get("migrated_to_db", False)]
         sessions.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
         return sessions
 
@@ -215,3 +223,16 @@ class ChatSessionManager:
                 logger.error("Failed to delete chat session file %s: %s", session_id, exc)
 
         return removed_anything
+
+    def mark_session_migrated(self, session_id: str, db_session_id: str = "") -> bool:
+        session_data = self.load_session(session_id)
+        if not session_data:
+            return False
+
+        session_data["migrated_to_db"] = True
+        if db_session_id:
+            session_data["db_session_id"] = str(db_session_id)
+        session_data["updated_at"] = _now_iso()
+        self._save_session_data(session_data)
+        self._upsert_index_entry(session_data)
+        return True

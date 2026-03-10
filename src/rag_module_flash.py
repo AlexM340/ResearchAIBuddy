@@ -7,6 +7,9 @@ import os
 import json
 import time
 import hashlib
+import re
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +71,44 @@ try:
 except ImportError:
     PICKLE_AVAILABLE = False
 
+try:
+    from storage import PostgresClient, SecondBrainRepository
+    STORAGE_AVAILABLE = True
+except Exception:
+    PostgresClient = None
+    SecondBrainRepository = None
+    STORAGE_AVAILABLE = False
+
+try:
+    from graph import Neo4jClient, GraphIngestionService, GraphQueryService
+    GRAPH_AVAILABLE = True
+except Exception:
+    Neo4jClient = None
+    GraphIngestionService = None
+    GraphQueryService = None
+    GRAPH_AVAILABLE = False
+
+try:
+    from query import (
+        QueryIntent,
+        RetrievalPlan,
+        EvidenceItem,
+        DecisionMemory,
+        RuleBasedIntentRouter,
+        HybridEvidenceFusion,
+        ContextBuilder,
+    )
+    QUERY_INTEL_AVAILABLE = True
+except Exception:
+    QueryIntent = None
+    RetrievalPlan = None
+    EvidenceItem = None
+    DecisionMemory = None
+    RuleBasedIntentRouter = None
+    HybridEvidenceFusion = None
+    ContextBuilder = None
+    QUERY_INTEL_AVAILABLE = False
+
 # Configurare logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,6 +131,31 @@ class RAGConfig:
     rerank_top_k: int = 8
     neighbor_window: int = 1
     hybrid_alpha: float = 0.7
+    # Second Brain configuration
+    retrieval_mode: str = "auto"
+    vector_top_k: int = 8
+    graph_top_k_paths: int = 6
+    hybrid_rerank_top_k: int = 8
+    vector_confidence_threshold: float = 0.35
+    context_budget_tokens: int = 8000
+    vector_budget_ratio: float = 0.65
+    graph_budget_ratio: float = 0.35
+    enable_graph_rag: bool = True
+    router_mode: str = "rule_based"
+    decision_extraction_enabled: bool = True
+    graph_max_hops: int = 2
+    graph_min_confidence: float = 0.70
+    graph_extraction_mode: str = "heuristic_fallback"
+    memory_consolidation_enabled: bool = True
+    memory_decay_days: int = 90
+    db_primary_strict: bool = True
+    ingestion_embedding_batch_size: int = 64
+    ingestion_max_workers: int = 4
+    postgres_dsn: str = ""
+    pgvector_embedding_dim: int = 384
+    neo4j_uri: str = ""
+    neo4j_user: str = ""
+    neo4j_password: str = ""
 
 class GeminiRateLimiter:
     """Rate limiter optimizat pentru Gemini Flash"""
@@ -1049,6 +1115,78 @@ class APCISystem:
         
         self.document_processor = SimpleDocumentProcessor(config)
         self.retriever = SimpleRetriever(config)
+
+        # Second Brain storage (Postgres + pgvector), optional and fallback-safe.
+        self.storage_client = None
+        self.repository = None
+        if STORAGE_AVAILABLE:
+            try:
+                self.storage_client = PostgresClient(
+                    dsn=config.postgres_dsn,
+                    embedding_dim=config.pgvector_embedding_dim,
+                    enabled=True,
+                )
+                self.repository = SecondBrainRepository(self.storage_client)
+                if self.repository.enabled:
+                    ready = self.repository.ensure_ready()
+                    logger.info("Storage backend Postgres activ: %s", ready)
+            except Exception as exc:
+                logger.warning("Storage backend init failed, fallback local: %s", exc)
+                self.storage_client = None
+                self.repository = None
+
+        # Graph layer (Neo4j), optional and fallback-safe.
+        self.neo4j_client = None
+        self.graph_ingestion = None
+        self.graph_query = None
+        if GRAPH_AVAILABLE and config.enable_graph_rag:
+            try:
+                self.neo4j_client = Neo4jClient(
+                    uri=config.neo4j_uri,
+                    user=config.neo4j_user,
+                    password=config.neo4j_password,
+                    enabled=True,
+                )
+                self.graph_ingestion = GraphIngestionService(
+                    self.neo4j_client,
+                    min_confidence=config.graph_min_confidence,
+                    extraction_mode=config.graph_extraction_mode,
+                    structured_extractor=self._extract_graph_structure_with_llm,
+                )
+                self.graph_query = GraphQueryService(
+                    self.neo4j_client,
+                    max_hops=config.graph_max_hops,
+                )
+                if self.neo4j_client.enabled:
+                    self.neo4j_client.ensure_constraints()
+                    logger.info("Graph backend Neo4j activ.")
+            except Exception as exc:
+                logger.warning("Graph backend init failed, fallback vector-only: %s", exc)
+                self.neo4j_client = None
+                self.graph_ingestion = None
+                self.graph_query = None
+
+        # Query intelligence components.
+        self.intent_router = None
+        self.hybrid_fusion = None
+        self.context_builder = None
+        if QUERY_INTEL_AVAILABLE:
+            self.intent_router = RuleBasedIntentRouter(
+                vector_confidence_threshold=config.vector_confidence_threshold
+            )
+            self.hybrid_fusion = HybridEvidenceFusion()
+            self.context_builder = ContextBuilder(
+                total_budget_tokens=config.context_budget_tokens,
+                vector_budget_ratio=config.vector_budget_ratio,
+                graph_budget_ratio=config.graph_budget_ratio,
+            )
+
+        # Local fallback memory when DB is not configured.
+        self.local_decisions: List[Dict[str, Any]] = []
+        self.local_preferences: List[Dict[str, Any]] = []
+        self.local_episodes: List[Dict[str, Any]] = []
+        self.local_tasks: List[Dict[str, Any]] = []
+        self.last_memory_consolidation_at: Optional[str] = None
         
         # Statistici
         self.stats = {
@@ -1088,6 +1226,28 @@ class APCISystem:
             
             # Construiește index cu cache persistent - aceasta este optimizarea cheie!
             self.retriever.build_index_with_cache(resolved_file_paths, processed_docs)
+
+            # Persistență Postgres + pgvector (opțional, fără a bloca flow-ul curent).
+            if self.repository and self.repository.enabled:
+                storage_embeddings = None
+                try:
+                    if self.retriever.embeddings_model:
+                        storage_embeddings = self._encode_embeddings_batched(
+                            [doc["content"] for doc in processed_docs]
+                        )
+                except Exception as exc:
+                    logger.warning("Embeddings storage generation failed: %s", exc)
+                    storage_embeddings = None
+
+                self.repository.ingest_processed_documents(
+                    resolved_file_paths,
+                    processed_docs,
+                    storage_embeddings,
+                )
+
+            # Ingestie incrementală în graf (offline-style).
+            if self.graph_ingestion and self.graph_ingestion.enabled:
+                self.graph_ingestion.ingest_chunks(processed_docs)
             
             self.stats["documents_indexed"] = len(processed_docs)
             
@@ -1101,6 +1261,130 @@ class APCISystem:
         except Exception as e:
             logger.error(f"Eroare la încărcarea documentelor: {e}")
             return False
+
+    def _encode_embeddings_batched(self, texts: List[str]) -> Any:
+        """Encode embeddings in batches to avoid memory spikes on large ingestions."""
+        if not texts or not self.retriever.embeddings_model:
+            return None
+
+        batch_size = max(8, int(self.config.ingestion_embedding_batch_size or 64))
+        encoded_batches: List[Any] = []
+        for start_idx in range(0, len(texts), batch_size):
+            batch = texts[start_idx:start_idx + batch_size]
+            encoded_batch = self.retriever.embeddings_model.encode(batch)
+            encoded_batches.append(encoded_batch)
+
+        if not encoded_batches:
+            return None
+
+        if NUMPY_AVAILABLE:
+            return np.vstack(encoded_batches)
+
+        merged: List[Any] = []
+        for batch in encoded_batches:
+            merged.extend(batch)
+        return merged
+
+    @staticmethod
+    def _calculate_file_hash(file_path: str) -> str:
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as file_handle:
+            for chunk in iter(lambda: file_handle.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    def filter_paths_for_ingestion(
+        self,
+        file_paths: List[str],
+        metadata_by_path: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, List[str]]:
+        """
+        Return ingestion candidates using Postgres as source-of-truth.
+        When storage is disabled/unavailable, all files are considered candidates.
+        """
+        resolved_paths: List[str] = []
+        seen = set()
+        for path in file_paths:
+            normalized = str(Path(path).resolve())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            resolved_paths.append(normalized)
+
+        if not resolved_paths:
+            return {"to_ingest": [], "already_indexed": []}
+
+        if not (self.repository and self.repository.enabled):
+            return {"to_ingest": resolved_paths, "already_indexed": []}
+
+        try:
+            metadata_by_path = metadata_by_path or {}
+            hash_by_path: Dict[str, str] = {}
+            paths_without_hash: List[str] = []
+
+            for path in resolved_paths:
+                metadata = metadata_by_path.get(path, {})
+                file_hash = (metadata.get("file_hash") or "").strip() if isinstance(metadata, dict) else ""
+                if file_hash:
+                    hash_by_path[path] = file_hash
+                else:
+                    paths_without_hash.append(path)
+
+            if paths_without_hash:
+                max_workers = max(1, int(self.config.ingestion_max_workers or 4))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_map = {
+                        pool.submit(self._calculate_file_hash, path): path
+                        for path in paths_without_hash
+                    }
+                    for future in as_completed(future_map):
+                        path = future_map[future]
+                        try:
+                            hash_by_path[path] = future.result()
+                        except Exception as exc:
+                            logger.warning("Hash generation failed for %s: %s", path, exc)
+                            hash_by_path[path] = ""
+
+            missing_hashes = set(
+                self.repository.list_missing_hashes([value for value in hash_by_path.values() if value])
+            )
+            to_ingest: List[str] = []
+            already_indexed: List[str] = []
+
+            for path in resolved_paths:
+                file_hash = hash_by_path.get(path, "")
+                if file_hash and file_hash in missing_hashes:
+                    to_ingest.append(path)
+                else:
+                    already_indexed.append(path)
+
+            return {"to_ingest": to_ingest, "already_indexed": already_indexed}
+        except Exception as exc:
+            logger.warning("Nu s-a putut filtra ingestia pe baza storage: %s", exc)
+            return {"to_ingest": resolved_paths, "already_indexed": []}
+
+    def get_storage_index_status(self) -> Dict[str, Any]:
+        """Return storage index status for UI bootstrap decisions."""
+        base_status = {
+            "storage_mode": "local_fallback",
+            "postgres_enabled": False,
+            "indexed_documents": 0,
+            "indexed_chunks": 0,
+            "last_sync_at": None,
+            "db_primary_strict": bool(self.config.db_primary_strict),
+        }
+        if not (self.repository and self.repository.enabled):
+            return base_status
+
+        index_status = self.repository.get_index_status()
+        return {
+            "storage_mode": "db_primary",
+            "postgres_enabled": True,
+            "indexed_documents": int(index_status.get("indexed_documents", 0) or 0),
+            "indexed_chunks": int(index_status.get("indexed_chunks", 0) or 0),
+            "last_sync_at": index_status.get("last_sync_at"),
+            "db_primary_strict": bool(self.config.db_primary_strict),
+        }
     
     def load_documents_legacy(self, file_paths: List[str]) -> bool:
         """Încarcă și indexează documente - versiunea originală fără cache"""
@@ -1211,6 +1495,723 @@ RĂSPUNS:"""
 
         return None
 
+    def _resolve_collection_filters(
+        self,
+        retrieval_mode: str,
+        active_collection: Optional[str],
+        general_collection: str
+    ) -> Optional[List[str]]:
+        normalized_mode = (retrieval_mode or "topic_general").strip().lower()
+        normalized_active = (active_collection or "").strip()
+        normalized_general = (general_collection or "general").strip()
+
+        if normalized_mode == "all":
+            return None
+        if normalized_mode == "topic":
+            return [normalized_active] if normalized_active else []
+        if normalized_mode in {"topic_general", "auto", ""}:
+            if normalized_active:
+                return [normalized_active, normalized_general]
+            return [normalized_general]
+        return None
+
+    @staticmethod
+    def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
+        if not raw_text:
+            return None
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+            cleaned = cleaned.strip()
+
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return None
+        return None
+
+    def _extract_graph_structure_with_llm(self, text: str) -> Dict[str, Any]:
+        """
+        Structured concept/relation extraction for GraphRAG ingestion.
+        Returns payload:
+        {
+          "concepts": [{"name": "...", "confidence": 0.0-1.0}],
+          "relations": [{"source": "...", "target": "...", "type": "...", "confidence": 0.0-1.0}]
+        }
+        """
+        if not text or not self.config.enable_graph_rag:
+            return {"concepts": [], "relations": []}
+
+        snippet = text[:2500]
+        prompt = (
+            "Extract a compact knowledge graph from the text.\n"
+            "Return STRICT JSON only (no markdown, no explanations).\n"
+            "Schema:\n"
+            "{\n"
+            '  "concepts": [{"name": "string", "confidence": 0.0}],\n'
+            '  "relations": [{"source": "string", "target": "string", "type": "RELATED_TO|DEPENDS_ON|CONTRADICTS|DERIVED_FROM", "confidence": 0.0}]\n'
+            "}\n"
+            "Rules:\n"
+            "- Max 12 concepts and max 16 relations.\n"
+            "- Use concise canonical names.\n"
+            "- confidence must be in [0,1].\n"
+            "- Only include relations grounded in text.\n"
+            f"TEXT:\n{snippet}"
+        )
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            raw = self.llm.generate(prompt)
+            self.stats["llm_calls"] += 1
+            payload = self._extract_json_object(raw) or {}
+            concepts = payload.get("concepts", [])
+            relations = payload.get("relations", [])
+            if not isinstance(concepts, list):
+                concepts = []
+            if not isinstance(relations, list):
+                relations = []
+            return {"concepts": concepts, "relations": relations}
+        except Exception as exc:
+            logger.warning("LLM graph extraction failed: %s", exc)
+            return {"concepts": [], "relations": []}
+
+    def _run_vector_retrieval(
+        self,
+        question: str,
+        scope_filter: Optional[Any],
+        collection_filters: Optional[List[str]],
+        k: int
+    ) -> List[Dict[str, Any]]:
+        vector_k = max(int(k), int(self.config.vector_top_k))
+
+        # Prefer Postgres vector retrieval if configured.
+        if (
+            self.repository
+            and self.repository.enabled
+            and self.retriever.embeddings_model is not None
+        ):
+            try:
+                query_embedding = self.retriever.embeddings_model.encode([question])[0]
+                if hasattr(query_embedding, "tolist"):
+                    query_embedding = query_embedding.tolist()
+                db_docs = self.repository.vector_search(
+                    query_embedding=query_embedding,
+                    collection_filters=collection_filters,
+                    top_k=vector_k,
+                )
+                if db_docs:
+                    return db_docs
+
+                # In strict DB-primary mode, empty DB results are final; avoid stale local fallback.
+                if self.config.db_primary_strict:
+                    return []
+            except Exception as exc:
+                logger.warning("DB vector retrieval failed; fallback to in-memory retriever: %s", exc)
+
+        # Fallback to in-memory retriever.
+        return self.retriever.retrieve(
+            question,
+            k=vector_k,
+            filter_fn=scope_filter,
+        )
+
+    def _run_graph_retrieval(
+        self,
+        question: str,
+        active_collection: Optional[str],
+        max_paths: int
+    ) -> List[Dict[str, Any]]:
+        if not self.graph_query or not self.graph_query.enabled:
+            return []
+        try:
+            return self.graph_query.retrieve_paths(
+                question=question,
+                active_collection=active_collection,
+                max_paths=max_paths,
+            )
+        except Exception as exc:
+            logger.warning("Graph retrieval failed: %s", exc)
+            return []
+
+    def _build_route_context(
+        self,
+        question: str,
+        route: str,
+        vector_docs: List[Dict[str, Any]],
+        graph_paths: List[Dict[str, Any]],
+        memory_hits: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        memory_hits = memory_hits or []
+
+        memory_lines: List[str] = []
+        memory_provenance: List[Dict[str, Any]] = []
+        for idx, item in enumerate(memory_hits[:3], start=1):
+            title = item.get("title", f"Memorie {idx}")
+            rationale = item.get("rationale", "")
+            topic = item.get("topic_collection", "")
+            memory_type = item.get("memory_type", "semantic")
+            citation = f"M{idx}"
+            memory_preview = rationale[:300] + "..." if isinstance(rationale, str) and len(rationale) > 300 else rationale
+            memory_lines.append(f"[{citation}] [{memory_type}] {title} ({topic}) -> {memory_preview}")
+            memory_provenance.append(
+                {
+                    "citation": citation,
+                    "kind": "memory",
+                    "score": float(item.get("confidence", 0.0) or 0.0),
+                    "source": item,
+                }
+            )
+
+        if (
+            self.context_builder is None
+            or self.hybrid_fusion is None
+            or not QUERY_INTEL_AVAILABLE
+        ):
+            prompt = self._create_rag_prompt(question, vector_docs[: self.config.max_context_docs])
+            if memory_lines:
+                prompt += (
+                    "\n\nMEMORIE PERSONALĂ:\n"
+                    + "\n".join(memory_lines)
+                    + "\nFolosește citări [M#] când utilizezi memorie personală."
+                )
+            return {
+                "prompt": prompt,
+                "provenance": memory_provenance,
+                "vector_sources": [doc.get("metadata", {}) for doc in vector_docs[: self.config.max_context_docs]],
+                "graph_sources": [],
+                "memory_sources": memory_hits[:3],
+                "selected_vector_docs": vector_docs[: self.config.max_context_docs],
+            }
+
+        if route == "hybrid":
+            evidence_items, provenance = self.hybrid_fusion.fuse(
+                vector_docs=vector_docs,
+                graph_paths=graph_paths,
+                rerank_top_k=self.config.hybrid_rerank_top_k,
+            )
+        else:
+            evidence_items, provenance = self.hybrid_fusion.fuse(
+                vector_docs=vector_docs,
+                graph_paths=[],
+                rerank_top_k=self.config.max_context_docs,
+            )
+
+        built = self.context_builder.build(question, evidence_items)
+        built["provenance"] = provenance if provenance else built.get("provenance", [])
+        if memory_lines:
+            built["prompt"] = (
+                built.get("prompt", "")
+                + "\n\nMEMORIE PERSONALĂ:\n"
+                + "\n".join(memory_lines)
+                + "\nFolosește citări [M#] când utilizezi memorie personală."
+            )
+            built["provenance"].extend(memory_provenance)
+        built["memory_sources"] = memory_hits[:3]
+
+        selected_vector_docs = []
+        for item in evidence_items:
+            if item.kind != "document":
+                continue
+            selected_vector_docs.append(
+                {
+                    "content": item.content,
+                    "metadata": item.source_ref,
+                    "retrieval_score": item.score,
+                }
+            )
+        built["selected_vector_docs"] = selected_vector_docs
+        return built
+
+    def _retrieve_memory_hits(
+        self,
+        question: str,
+        active_collection: Optional[str],
+        limit: int = 5,
+        time_window_days: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        memory_hits: List[Dict[str, Any]] = []
+        dedup_ids = set()
+
+        def _push(items: List[Dict[str, Any]]) -> None:
+            for item in items:
+                memory_id = str(item.get("id", ""))
+                if memory_id and memory_id in dedup_ids:
+                    continue
+                if memory_id:
+                    dedup_ids.add(memory_id)
+                memory_hits.append(item)
+                if len(memory_hits) >= limit:
+                    return
+
+        if self.repository and self.repository.enabled:
+            _push(
+                self.repository.search_preferences(
+                    question=question,
+                    topic_collection=active_collection,
+                    limit=limit,
+                )
+            )
+            if len(memory_hits) < limit:
+                _push(
+                    self.repository.search_tasks(
+                        question=question,
+                        topic_collection=active_collection,
+                        limit=limit,
+                    )
+                )
+            if len(memory_hits) < limit:
+                _push(
+                    self.repository.search_decisions(
+                        question=question,
+                        topic_collection=active_collection,
+                        limit=limit,
+                    )
+                )
+            if len(memory_hits) < limit:
+                _push(
+                    self.repository.search_episodes(
+                        question=question,
+                        topic_collection=active_collection,
+                        limit=limit,
+                        time_window_days=time_window_days,
+                    )
+                )
+        elif self.graph_query and self.graph_query.enabled:
+            _push(
+                self.graph_query.retrieve_decisions(
+                    question=question,
+                    active_collection=active_collection,
+                    limit=limit,
+                )
+            )
+
+        if len(memory_hits) >= limit:
+            return memory_hits[:limit]
+
+        # Local fallback memory search for single-user mode.
+        query_tokens = {token for token in re.findall(r"[A-Za-z0-9_\\-]{3,}", question.lower())}
+        for source_items, memory_type in (
+            (self.local_preferences, "procedural"),
+            (self.local_tasks, "task"),
+            (self.local_decisions, "semantic"),
+            (self.local_episodes, "episodic"),
+        ):
+            for item in reversed(source_items):
+                if active_collection and item.get("topic_collection") not in {active_collection, "", "general"}:
+                    continue
+                haystack = f"{item.get('title', '')} {item.get('rationale', '')}".lower()
+                if any(token in haystack for token in query_tokens):
+                    local_item = item.copy()
+                    local_item.setdefault("memory_type", memory_type)
+                    _push([local_item])
+                    if len(memory_hits) >= limit:
+                        return memory_hits[:limit]
+
+        return memory_hits[:limit]
+
+    def _extract_decision_candidate(
+        self,
+        question: str,
+        response: str,
+        active_collection: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not self.config.decision_extraction_enabled:
+            return None
+
+        question_lower = (question or "").lower()
+        markers = ["decid", "aleg", "hotar", "concluz", "plan", "urmatorul pas"]
+        if not any(marker in question_lower for marker in markers):
+            return None
+
+        title = (question or "").strip()
+        if len(title) > 120:
+            title = title[:117] + "..."
+        rationale = (response or "").strip()
+        if len(rationale) > 800:
+            rationale = rationale[:800] + "..."
+
+        if not title or not rationale:
+            return None
+
+        decision_id = f"decision_{hashlib.sha1(f'{title}_{rationale}'.encode('utf-8')).hexdigest()[:12]}"
+        return {
+            "id": decision_id,
+            "title": title,
+            "rationale": rationale,
+            "topic_collection": active_collection or "",
+            "confidence": 0.75,
+            "memory_type": "semantic",
+            "source": "decision_extractor",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _extract_preference_candidates(
+        self,
+        question: str,
+        active_collection: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Extract procedural memory candidates from user intent/preferences."""
+        text = (question or "").strip()
+        text_lower = text.lower()
+        markers = ["prefer", "vreau", "foloseste", "evita", "te rog sa", "seteaza"]
+        if not any(marker in text_lower for marker in markers):
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        rules = [
+            ("response_style", r"(?:raspuns|explicatie)\s+(?:scurt|scurta|concis)", "Raspunsuri concise"),
+            ("response_style", r"(?:raspuns|explicatie)\s+(?:detaliat|detaliata|lung)", "Raspunsuri detaliate"),
+            ("citation_mode", r"(?:cu|adauga)\s+(?:surse|citari|provenienta)", "Include citari in raspuns"),
+            ("language", r"\b(in|pe)\s+romana\b", "Raspunde in romana"),
+            ("language", r"\b(in|pe)\s+engleza\b", "Raspunde in engleza"),
+        ]
+
+        for pref_key, pattern, pref_value in rules:
+            if re.search(pattern, text_lower):
+                pref_id = hashlib.sha1(
+                    f"{pref_key}_{pref_value}_{active_collection or ''}".encode("utf-8")
+                ).hexdigest()[:12]
+                candidates.append(
+                    {
+                        "id": f"pref_{pref_id}",
+                        "preference_key": pref_key,
+                        "preference_value": pref_value,
+                        "title": f"Preferinta: {pref_key}",
+                        "rationale": pref_value,
+                        "topic_collection": active_collection or "",
+                        "confidence": 0.82,
+                        "memory_type": "procedural",
+                        "source": "preference_extractor",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+        return candidates
+
+    def _persist_preferences(self, preferences: List[Dict[str, Any]]) -> None:
+        if not preferences:
+            return
+
+        for preference in preferences:
+            preference.setdefault("memory_type", "procedural")
+            preference.setdefault("source", "preference")
+            preference["updated_at"] = datetime.now(timezone.utc).isoformat()
+            preference.setdefault("created_at", preference["updated_at"])
+
+            pref_key = preference.get("preference_key", "")
+            pref_topic = preference.get("topic_collection", "")
+            matched = None
+            for item in self.local_preferences:
+                if (
+                    item.get("preference_key") == pref_key
+                    and item.get("topic_collection", "") == pref_topic
+                ):
+                    matched = item
+                    break
+
+            if matched is None:
+                self.local_preferences.append(preference.copy())
+            else:
+                previous_conf = float(matched.get("confidence", 0.0) or 0.0)
+                current_conf = float(preference.get("confidence", 0.0) or 0.0)
+                # Allow override when confidence is at least as strong.
+                if current_conf >= previous_conf:
+                    matched.update(preference)
+
+            if self.repository and self.repository.enabled:
+                self.repository.upsert_preference(
+                    preference_key=preference.get("preference_key", ""),
+                    preference_value=preference.get("preference_value", ""),
+                    topic_collection=preference.get("topic_collection", ""),
+                    confidence=float(preference.get("confidence", 0.8)),
+                )
+
+    def _extract_task_candidates(
+        self,
+        question: str,
+        response: str,
+        active_collection: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        text = (question or "").strip()
+        text_lower = text.lower()
+        if not text:
+            return []
+
+        # Do not create tasks for pure listing/status queries.
+        if any(
+            marker in text_lower
+            for marker in {"ce task", "lista task", "taskurile", "task-urile", "ce am de facut"}
+        ):
+            return []
+
+        markers = {
+            "task",
+            "todo",
+            "to do",
+            "reminder",
+            "reaminteste",
+            "adu-mi aminte",
+            "trebuie sa",
+            "creeaza un task",
+            "adauga task",
+        }
+        if not any(marker in text_lower for marker in markers):
+            return []
+
+        extracted_title = ""
+        patterns = [
+            r"(?:creeaza|adauga)\s+(?:un\s+)?task(?:\s*[:\-])?\s*(.+)$",
+            r"(?:trebuie\s+sa)\s+(.+)$",
+            r"(?:adu-mi aminte\s+sa)\s+(.+)$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                extracted_title = match.group(1).strip(" .,:;")
+                break
+        if not extracted_title:
+            extracted_title = text.strip(" .,:;")
+
+        if len(extracted_title) > 160:
+            extracted_title = extracted_title[:157] + "..."
+        if not extracted_title:
+            return []
+
+        details = (response or "").strip()
+        if len(details) > 700:
+            details = details[:700] + "..."
+
+        task_id = hashlib.sha1(
+            f"{extracted_title}_{active_collection or ''}".encode("utf-8")
+        ).hexdigest()[:12]
+        return [
+            {
+                "id": f"task_{task_id}",
+                "title": extracted_title,
+                "details": details,
+                "topic_collection": active_collection or "",
+                "status": "open",
+                "priority": "normal",
+                "confidence": 0.78,
+                "memory_type": "task",
+                "source": "extracted_from_chat",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+
+    def _persist_tasks(self, tasks: List[Dict[str, Any]]) -> None:
+        if not tasks:
+            return
+
+        existing_ids = {item.get("id") for item in self.local_tasks}
+        for task in tasks:
+            task_id = task.get("id")
+            if task_id and task_id not in existing_ids:
+                self.local_tasks.append(task.copy())
+                existing_ids.add(task_id)
+
+            if self.repository and self.repository.enabled:
+                self.repository.create_task(
+                    title=task.get("title", ""),
+                    details=task.get("details", ""),
+                    topic_collection=task.get("topic_collection", ""),
+                    status=task.get("status", "open"),
+                    priority=task.get("priority", "normal"),
+                    confidence=float(task.get("confidence", 0.7) or 0.7),
+                )
+
+    def list_tasks(
+        self,
+        active_collection: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        if self.repository and self.repository.enabled:
+            return self.repository.list_tasks(
+                topic_collection=active_collection,
+                status=status,
+                limit=limit,
+            )
+
+        scoped_tasks: List[Dict[str, Any]] = []
+        status_filter = (status or "").strip().lower()
+        for item in self.local_tasks:
+            if active_collection and item.get("topic_collection") not in {"", "general", active_collection}:
+                continue
+            if status_filter and str(item.get("status", "")).lower() != status_filter:
+                continue
+            scoped_tasks.append(item.copy())
+        scoped_tasks.sort(key=lambda value: value.get("updated_at", ""), reverse=True)
+        return scoped_tasks[: max(1, int(limit))]
+
+    def update_task_status(self, task_id: Union[str, int], status: str) -> bool:
+        clean_status = (status or "").strip().lower()
+        if clean_status not in {"open", "in_progress", "done", "cancelled"}:
+            return False
+
+        numeric_id: Optional[int] = None
+        try:
+            numeric_id = int(task_id)
+        except Exception:
+            numeric_id = None
+
+        if self.repository and self.repository.enabled and numeric_id is not None:
+            return self.repository.update_task_status(numeric_id, clean_status)
+
+        for task in self.local_tasks:
+            if str(task.get("id", "")) == str(task_id):
+                task["status"] = clean_status
+                task["updated_at"] = datetime.now(timezone.utc).isoformat()
+                return True
+        return False
+
+    def _apply_memory_decay(self) -> None:
+        if self.config.memory_decay_days <= 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(self.config.memory_decay_days))
+
+        def _is_recent(item: Dict[str, Any]) -> bool:
+            timestamp = item.get("updated_at") or item.get("created_at")
+            if not timestamp:
+                return True
+            try:
+                normalized = str(timestamp).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt >= cutoff
+            except Exception:
+                return True
+
+        self.local_episodes = [item for item in self.local_episodes if _is_recent(item)]
+
+    def _run_memory_consolidation(self, active_collection: Optional[str]) -> None:
+        if not self.config.memory_consolidation_enabled:
+            return
+
+        now = datetime.now(timezone.utc)
+        if self.last_memory_consolidation_at:
+            try:
+                last_run = datetime.fromisoformat(self.last_memory_consolidation_at.replace("Z", "+00:00"))
+                if now - last_run < timedelta(minutes=5):
+                    return
+            except Exception:
+                pass
+
+        marker_tokens = {"am decis", "concluzie", "hotaram", "urmatorul pas", "plan"}
+        existing_titles = {
+            str(item.get("title", "")).strip().lower()
+            for item in self.local_decisions
+        }
+        for episode in self.local_episodes[-40:]:
+            if active_collection and episode.get("topic_collection") not in {"", "general", active_collection}:
+                continue
+            rationale = str(episode.get("rationale", "")).strip()
+            lowered = rationale.lower()
+            if not rationale or not any(token in lowered for token in marker_tokens):
+                continue
+            title = str(episode.get("title", "Consolidare memorie")).strip()[:120]
+            if not title or title.lower() in existing_titles:
+                continue
+            decision = {
+                "id": f"decision_{hashlib.sha1(f'consolidated_{title}'.encode('utf-8')).hexdigest()[:12]}",
+                "title": title,
+                "rationale": rationale[:800],
+                "topic_collection": episode.get("topic_collection", "") or "",
+                "confidence": max(0.55, float(episode.get("confidence", 0.6))),
+                "memory_type": "semantic",
+                "source": "memory_consolidation",
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+            }
+            self._persist_decision(decision)
+            existing_titles.add(title.lower())
+
+        self._apply_memory_decay()
+        self.last_memory_consolidation_at = now.isoformat()
+
+    def _capture_episode(
+        self,
+        question: str,
+        response: str,
+        active_collection: Optional[str],
+    ) -> None:
+        """Store lightweight episodic memory for local fallback mode."""
+        question_clean = (question or "").strip()
+        response_clean = (response or "").strip()
+        if not question_clean or not response_clean:
+            return
+
+        episode_id = hashlib.sha1(
+            f"{question_clean}_{response_clean[:200]}_{active_collection or ''}".encode("utf-8")
+        ).hexdigest()[:12]
+        existing_ids = {item.get("id") for item in self.local_episodes}
+        if episode_id in existing_ids:
+            return
+
+        self.local_episodes.append(
+            {
+                "id": f"episode_{episode_id}",
+                "title": question_clean[:140],
+                "rationale": response_clean[:900],
+                "topic_collection": active_collection or "",
+                "confidence": 0.6,
+                "memory_type": "episodic",
+                "source": "chat_episode",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if len(self.local_episodes) > 200:
+            self.local_episodes = self.local_episodes[-200:]
+
+    def _persist_decision(self, decision: Dict[str, Any]) -> None:
+        if not decision:
+            return
+        decision.setdefault("memory_type", "semantic")
+        decision.setdefault("source", "decision")
+        decision.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+        decision.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+
+        # Local fallback memory.
+        existing_ids = {item.get("id") for item in self.local_decisions}
+        if decision.get("id") not in existing_ids:
+            self.local_decisions.append(decision)
+
+        # Persist to Postgres if available.
+        if self.repository and self.repository.enabled:
+            self.repository.save_decision(
+                title=decision.get("title", ""),
+                rationale=decision.get("rationale", ""),
+                topic_collection=decision.get("topic_collection", ""),
+                confidence=float(decision.get("confidence", 0.75)),
+            )
+
+        # Mirror decision into graph if available.
+        if self.graph_ingestion and self.graph_ingestion.enabled:
+            self.graph_ingestion.ingest_decision(
+                decision_id=decision.get("id", ""),
+                title=decision.get("title", ""),
+                rationale=decision.get("rationale", ""),
+                topic_collection=decision.get("topic_collection", ""),
+            )
+
     @staticmethod
     def _is_insufficient_response(response: str) -> bool:
         response_text = (response or "").strip().upper()
@@ -1292,7 +2293,10 @@ INSTRUCȚIUNI:
         start_time: float,
         retrieval_mode: str,
         active_collection: Optional[str],
-        reason: str
+        reason: str,
+        route_used: str = "vector",
+        router_reason: str = "",
+        memory_hits: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         external_sources = self._fetch_external_sources(question)
         external_prompt = self._create_external_prompt(question, external_sources)
@@ -1305,9 +2309,49 @@ INSTRUCȚIUNI:
         response_time = time.time() - start_time
         self._update_avg_response_time(response_time)
 
+        if self.repository and self.repository.enabled:
+            self.repository.log_retrieval(
+                question=question,
+                route_used=route_used,
+                latency_ms=response_time * 1000.0,
+                metrics={
+                    "fallback_reason": reason,
+                    "external_sources": len(external_sources),
+                    "memory_hits": len(memory_hits or []),
+                },
+            )
+
+        preference_candidates = self._extract_preference_candidates(
+            question=question,
+            active_collection=active_collection,
+        )
+        if preference_candidates:
+            self._persist_preferences(preference_candidates)
+
+        self._capture_episode(
+            question=question,
+            response=external_response,
+            active_collection=active_collection,
+        )
+
+        task_candidates = self._extract_task_candidates(
+            question=question,
+            response=external_response,
+            active_collection=active_collection,
+        )
+        if task_candidates:
+            self._persist_tasks(task_candidates)
+
+        self._run_memory_consolidation(active_collection=active_collection)
+        tasks_snapshot = self.list_tasks(active_collection=active_collection, limit=20)
+
         return {
             "response": external_response,
             "sources": [],
+            "graph_sources": [],
+            "memory_hits": memory_hits or [],
+            "tasks": tasks_snapshot,
+            "provenance": [],
             "external_sources": external_sources,
             "cached": False,
             "response_time": response_time,
@@ -1315,45 +2359,118 @@ INSTRUCȚIUNI:
             "answer_origin": "external",
             "fallback_reason": reason,
             "retrieval_mode": retrieval_mode,
-            "active_collection": active_collection
+            "active_collection": active_collection,
+            "route_used": route_used,
+            "router_reason": router_reason or f"fallback:{reason}",
         }
 
     def query(
         self,
         question: str,
-        retrieval_mode: str = "topic_general",
+        retrieval_mode: str = "auto",
         active_collection: Optional[str] = None,
-        general_collection: str = "general"
+        general_collection: str = "general",
+        time_window_days: Optional[int] = None,
+        include_memory: bool = True,
     ) -> Dict[str, Any]:
         """Procesează o întrebare și returnează răspunsul"""
         start_time = time.time()
         self.stats["total_queries"] += 1
         
         try:
+            scope_mode = retrieval_mode if retrieval_mode in {"topic", "topic_general", "all"} else "topic_general"
             scope_filter = self._build_scope_filter(
-                retrieval_mode,
+                scope_mode,
                 active_collection,
                 general_collection
             )
-
-            # Regăsește context relevant
-            context_docs = self.retriever.retrieve(
-                question,
-                k=self.config.max_context_docs,
-                filter_fn=scope_filter
+            collection_filters = self._resolve_collection_filters(
+                scope_mode,
+                active_collection,
+                general_collection,
             )
 
-            if not context_docs:
+            # Regăsește context vectorial.
+            vector_docs = self._run_vector_retrieval(
+                question,
+                scope_filter=scope_filter,
+                collection_filters=collection_filters,
+                k=self.config.max_context_docs,
+            )
+
+            # Router intent -> retrieval plan.
+            vector_confidence = (
+                self.hybrid_fusion.estimate_vector_confidence(vector_docs)
+                if self.hybrid_fusion is not None
+                else 0.0
+            )
+
+            if self.intent_router is not None:
+                intent = self.intent_router.classify(question, time_window_days=time_window_days)
+                plan = self.intent_router.build_plan(
+                    intent=intent,
+                    retrieval_mode=retrieval_mode,
+                    vector_top_k=self.config.vector_top_k,
+                    graph_top_k_paths=self.config.graph_top_k_paths,
+                    hybrid_rerank_top_k=self.config.hybrid_rerank_top_k,
+                    vector_confidence=vector_confidence,
+                )
+                route_used = plan.route
+                router_reason = plan.reason
+            else:
+                route_used = "vector"
+                router_reason = "query intelligence unavailable"
+
+            graph_paths: List[Dict[str, Any]] = []
+            if route_used == "hybrid" and self.config.enable_graph_rag:
+                graph_paths = self._run_graph_retrieval(
+                    question=question,
+                    active_collection=active_collection,
+                    max_paths=self.config.graph_top_k_paths,
+                )
+
+            memory_hits = self._retrieve_memory_hits(
+                question=question,
+                active_collection=active_collection,
+                limit=5,
+                time_window_days=time_window_days,
+            ) if include_memory else []
+
+            if not vector_docs and not graph_paths:
                 return self._run_external_fallback(
                     question,
                     start_time,
                     retrieval_mode,
                     active_collection,
-                    reason="no_internal_context"
+                    reason="no_internal_context",
+                    route_used=route_used,
+                    router_reason=router_reason,
+                    memory_hits=memory_hits,
                 )
-            
-            # Creează prompt
-            prompt = self._create_rag_prompt(question, context_docs)
+
+            context_payload = self._build_route_context(
+                question=question,
+                route=route_used,
+                vector_docs=vector_docs,
+                graph_paths=graph_paths,
+                memory_hits=memory_hits,
+            )
+            prompt = context_payload.get("prompt", "")
+            selected_vector_docs = context_payload.get("selected_vector_docs", vector_docs)
+            provenance = context_payload.get("provenance", [])
+            graph_sources = context_payload.get("graph_sources", [])
+
+            if not prompt:
+                return self._run_external_fallback(
+                    question,
+                    start_time,
+                    retrieval_mode,
+                    active_collection,
+                    reason="context_budget_empty",
+                    route_used=route_used,
+                    router_reason=router_reason,
+                    memory_hits=memory_hits,
+                )
             
             # Verifică cache
             cached_response = None
@@ -1369,19 +2486,63 @@ INSTRUCȚIUNI:
                             start_time,
                             retrieval_mode,
                             active_collection,
-                            reason="insufficient_cached_context"
+                            reason="insufficient_cached_context",
+                            route_used=route_used,
+                            router_reason=router_reason,
+                            memory_hits=memory_hits,
                         )
+
+                    response_time = time.time() - start_time
+                    if self.repository and self.repository.enabled:
+                        self.repository.log_retrieval(
+                            question=question,
+                            route_used=route_used,
+                            latency_ms=response_time * 1000.0,
+                            metrics={
+                                "cached": True,
+                                "vector_docs": len(selected_vector_docs),
+                                "graph_paths": len(graph_sources),
+                            },
+                        )
+
+                    preference_candidates = self._extract_preference_candidates(
+                        question=question,
+                        active_collection=active_collection,
+                    )
+                    if preference_candidates:
+                        self._persist_preferences(preference_candidates)
+
+                    task_candidates = self._extract_task_candidates(
+                        question=question,
+                        response=cached_response,
+                        active_collection=active_collection,
+                    )
+                    if task_candidates:
+                        self._persist_tasks(task_candidates)
+
+                    self._capture_episode(
+                        question=question,
+                        response=cached_response,
+                        active_collection=active_collection,
+                    )
+                    self._run_memory_consolidation(active_collection=active_collection)
 
                     return {
                         "response": cached_response,
-                        "sources": [doc['metadata'] for doc in context_docs],
+                        "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
+                        "graph_sources": graph_sources,
+                        "memory_hits": memory_hits,
+                        "tasks": self.list_tasks(active_collection=active_collection, limit=20),
+                        "provenance": provenance,
                         "external_sources": [],
                         "cached": True,
-                        "response_time": time.time() - start_time,
+                        "response_time": response_time,
                         "model_used": self.llm.model_name,
                         "answer_origin": "internal",
                         "retrieval_mode": retrieval_mode,
-                        "active_collection": active_collection
+                        "active_collection": active_collection,
+                        "route_used": route_used,
+                        "router_reason": router_reason,
                     }
             
             # Rate limiting
@@ -1403,24 +2564,78 @@ INSTRUCȚIUNI:
                     start_time,
                     retrieval_mode,
                     active_collection,
-                    reason="insufficient_internal_context"
+                    reason="insufficient_internal_context",
+                    route_used=route_used,
+                    router_reason=router_reason,
+                    memory_hits=memory_hits,
                 )
             
             # Actualizează statistici
             response_time = time.time() - start_time
             self._update_avg_response_time(response_time)
+
+            preference_candidates = self._extract_preference_candidates(
+                question=question,
+                active_collection=active_collection,
+            )
+            if preference_candidates:
+                self._persist_preferences(preference_candidates)
+
+            decision_candidate = self._extract_decision_candidate(
+                question=question,
+                response=response,
+                active_collection=active_collection,
+            )
+            if decision_candidate:
+                self._persist_decision(decision_candidate)
+
+            self._capture_episode(
+                question=question,
+                response=response,
+                active_collection=active_collection,
+            )
+
+            task_candidates = self._extract_task_candidates(
+                question=question,
+                response=response,
+                active_collection=active_collection,
+            )
+            if task_candidates:
+                self._persist_tasks(task_candidates)
+
+            self._run_memory_consolidation(active_collection=active_collection)
+            tasks_snapshot = self.list_tasks(active_collection=active_collection, limit=20)
+
+            if self.repository and self.repository.enabled:
+                self.repository.log_retrieval(
+                    question=question,
+                    route_used=route_used,
+                    latency_ms=response_time * 1000.0,
+                    metrics={
+                        "cached": False,
+                        "vector_docs": len(selected_vector_docs),
+                        "graph_paths": len(graph_sources),
+                        "memory_hits": len(memory_hits),
+                    },
+                )
             
             return {
                 "response": response,
-                "sources": [doc['metadata'] for doc in context_docs],
+                "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
+                "graph_sources": graph_sources,
+                "memory_hits": memory_hits,
+                "tasks": tasks_snapshot,
+                "provenance": provenance,
                 "external_sources": [],
                 "cached": False,
                 "response_time": response_time,
                 "model_used": self.llm.model_name,
-                "context_docs_count": len(context_docs),
+                "context_docs_count": len(selected_vector_docs),
                 "answer_origin": "internal",
                 "retrieval_mode": retrieval_mode,
-                "active_collection": active_collection
+                "active_collection": active_collection,
+                "route_used": route_used,
+                "router_reason": router_reason,
             }
             
         except Exception as e:
@@ -1428,11 +2643,17 @@ INSTRUCȚIUNI:
             return {
                 "response": f"Ne pare rău, a apărut o eroare: {str(e)[:100]}...",
                 "sources": [],
+                "graph_sources": [],
+                "memory_hits": [],
+                "tasks": [],
+                "provenance": [],
                 "external_sources": [],
                 "cached": False,
                 "response_time": time.time() - start_time,
                 "error": str(e),
-                "answer_origin": "error"
+                "answer_origin": "error",
+                "route_used": "error",
+                "router_reason": "exception",
             }
     
     def _update_avg_response_time(self, new_time: float):
@@ -1459,22 +2680,78 @@ INSTRUCȚIUNI:
                 "retrieval_candidates": self.config.retrieval_candidates,
                 "rerank_top_k": self.config.rerank_top_k,
                 "neighbor_window": self.config.neighbor_window,
-                "hybrid_alpha": self.config.hybrid_alpha
+                "hybrid_alpha": self.config.hybrid_alpha,
+                "vector_top_k": self.config.vector_top_k,
+                "graph_top_k_paths": self.config.graph_top_k_paths,
+                "hybrid_rerank_top_k": self.config.hybrid_rerank_top_k,
+                "vector_confidence_threshold": self.config.vector_confidence_threshold,
+                "enable_graph_rag": self.config.enable_graph_rag,
+                "context_budget_tokens": self.config.context_budget_tokens,
+                "decision_extraction_enabled": self.config.decision_extraction_enabled,
+                "graph_extraction_mode": self.config.graph_extraction_mode,
+                "memory_consolidation_enabled": self.config.memory_consolidation_enabled,
+                "memory_decay_days": self.config.memory_decay_days,
+                "db_primary_strict": self.config.db_primary_strict,
+                "ingestion_embedding_batch_size": self.config.ingestion_embedding_batch_size,
+                "ingestion_max_workers": self.config.ingestion_max_workers,
             },
             "dependencies": {
                 "genai_available": GENAI_AVAILABLE,
                 "langchain_available": LANGCHAIN_AVAILABLE,
                 "sentence_transformers_available": SENTENCE_TRANSFORMERS_AVAILABLE,
                 "diskcache_available": DISKCACHE_AVAILABLE,
-                "pickle_available": PICKLE_AVAILABLE
-            }
+                "pickle_available": PICKLE_AVAILABLE,
+                "storage_available": STORAGE_AVAILABLE,
+                "graph_available": GRAPH_AVAILABLE,
+                "query_intel_available": QUERY_INTEL_AVAILABLE,
+            },
+            "backends": {
+                "postgres_enabled": bool(self.repository and self.repository.enabled),
+                "neo4j_enabled": bool(self.graph_query and self.graph_query.enabled),
+                "local_decisions_count": len(self.local_decisions),
+                "local_preferences_count": len(self.local_preferences),
+                "local_episodes_count": len(self.local_episodes),
+                "local_tasks_count": len(self.local_tasks),
+                "last_memory_consolidation_at": self.last_memory_consolidation_at,
+            },
         }
+
+        status["storage_index_status"] = self.get_storage_index_status()
+        status["second_brain_status"] = self.get_second_brain_status()
         
         # Calculează cache hit rate
         if self.cache_manager:
             cache_stats = self.cache_manager.get_stats()
             status["cache_hit_rate"] = (self.stats["cache_hits"] / max(self.stats["total_queries"], 1)) * 100
-        
+
+        return status
+
+    def get_second_brain_status(self) -> Dict[str, Any]:
+        status = {
+            "memory_consolidation_enabled": bool(self.config.memory_consolidation_enabled),
+            "memory_decay_days": int(self.config.memory_decay_days),
+            "last_memory_consolidation_at": self.last_memory_consolidation_at,
+            "local": {
+                "decisions": len(self.local_decisions),
+                "preferences": len(self.local_preferences),
+                "episodes": len(self.local_episodes),
+                "tasks": len(self.local_tasks),
+                "open_tasks": len(
+                    [item for item in self.local_tasks if item.get("status", "open") in {"open", "in_progress"}]
+                ),
+            },
+            "db": {
+                "enabled": bool(self.repository and self.repository.enabled),
+                "decisions_count": 0,
+                "preferences_count": 0,
+                "tasks_open_count": 0,
+                "tasks_total_count": 0,
+                "messages_count": 0,
+            },
+        }
+        if self.repository and self.repository.enabled:
+            db_stats = self.repository.get_second_brain_status()
+            status["db"].update(db_stats)
         return status
     
     def clear_embeddings_cache(self):
@@ -1522,3 +2799,4 @@ __all__ = [
     'GeminiRateLimiter',
     'SimpleCache'
 ]
+

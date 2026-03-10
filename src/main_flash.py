@@ -82,6 +82,8 @@ def build_metadata_entry(doc_id: str, doc_info: Dict[str, Any], file_path: Path)
         "doc_id": doc_id,
         "filename": doc_info.get("original_name", file_path.name),
         "original_name": doc_info.get("original_name", file_path.name),
+        "file_hash": doc_info.get("file_hash", ""),
+        "file_size": doc_info.get("file_size", 0),
         "file_type": doc_info.get("file_type", file_path.suffix),
         "collection": collection,
         "source_scope": source_scope,
@@ -117,6 +119,37 @@ def load_config() -> Dict[str, Any]:
             "neighbor_window": 1,
             "hybrid_alpha": 0.7
         },
+        "storage": {
+            "postgres_dsn": "",
+            "pgvector_embedding_dim": 384
+        },
+        "graph": {
+            "neo4j_uri": "",
+            "neo4j_user": "",
+            "neo4j_password": ""
+        },
+        "second_brain": {
+            "enable_graph_rag": True,
+            "router_mode": "rule_based",
+            "vector_confidence_threshold": 0.35,
+            "context_budget_tokens": 8000,
+            "vector_budget_ratio": 0.65,
+            "graph_budget_ratio": 0.35,
+            "decision_extraction_enabled": True,
+            "graph_max_hops": 2,
+            "graph_min_confidence": 0.70,
+            "graph_extraction_mode": "heuristic_fallback",
+            "memory_consolidation_enabled": True,
+            "memory_decay_days": 90,
+            "db_primary_strict": True,
+            "ingestion_embedding_batch_size": 64,
+            "ingestion_max_workers": 4
+        },
+        "retrieval": {
+            "vector_top_k": 8,
+            "graph_top_k_paths": 6,
+            "hybrid_rerank_top_k": 8
+        },
         "ui": {
             "title": "APCI - Asistentul Personalizat de Cercetare și Învățare",
             "theme": "dark"
@@ -132,7 +165,7 @@ def load_config() -> Dict[str, Any]:
             merged_config = default_config.copy()
             
             # Merge secțiuni principale
-            for key in ['models', 'gemini', 'chunking', 'rag', 'ui']:
+            for key in ['models', 'gemini', 'chunking', 'rag', 'storage', 'graph', 'second_brain', 'retrieval', 'ui']:
                 if key in file_config:
                     if key in merged_config:
                         merged_config[key].update(file_config[key])
@@ -155,6 +188,17 @@ def load_config() -> Dict[str, Any]:
 def build_apci_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     """Construiește configurația APCI folosită la inițializarea sistemului."""
     rag_config = config.get("rag", {})
+    second_brain = config.get("second_brain", {})
+    retrieval_cfg = config.get("retrieval", {})
+    storage_cfg = config.get("storage", {})
+    graph_cfg = config.get("graph", {})
+
+    # Permite override din .env pentru secrete/connection strings.
+    postgres_dsn = os.getenv("POSTGRES_DSN", storage_cfg.get("postgres_dsn", "")).strip()
+    neo4j_uri = os.getenv("NEO4J_URI", graph_cfg.get("neo4j_uri", "")).strip()
+    neo4j_user = os.getenv("NEO4J_USER", graph_cfg.get("neo4j_user", "")).strip()
+    neo4j_password = os.getenv("NEO4J_PASSWORD", graph_cfg.get("neo4j_password", "")).strip()
+
     return {
         'model_name': config['models']['primary_llm'],
         'fallback_model': config['models']['fallback_llm'],
@@ -169,7 +213,30 @@ def build_apci_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
         'retrieval_candidates': rag_config.get("retrieval_candidates", 20),
         'rerank_top_k': rag_config.get("rerank_top_k", 8),
         'neighbor_window': rag_config.get("neighbor_window", 1),
-        'hybrid_alpha': rag_config.get("hybrid_alpha", 0.7)
+        'hybrid_alpha': rag_config.get("hybrid_alpha", 0.7),
+        'vector_top_k': retrieval_cfg.get("vector_top_k", 8),
+        'graph_top_k_paths': retrieval_cfg.get("graph_top_k_paths", 6),
+        'hybrid_rerank_top_k': retrieval_cfg.get("hybrid_rerank_top_k", 8),
+        'enable_graph_rag': second_brain.get("enable_graph_rag", True),
+        'router_mode': second_brain.get("router_mode", "rule_based"),
+        'vector_confidence_threshold': second_brain.get("vector_confidence_threshold", 0.35),
+        'context_budget_tokens': second_brain.get("context_budget_tokens", 8000),
+        'vector_budget_ratio': second_brain.get("vector_budget_ratio", 0.65),
+        'graph_budget_ratio': second_brain.get("graph_budget_ratio", 0.35),
+        'decision_extraction_enabled': second_brain.get("decision_extraction_enabled", True),
+        'graph_max_hops': second_brain.get("graph_max_hops", 2),
+        'graph_min_confidence': second_brain.get("graph_min_confidence", 0.70),
+        'graph_extraction_mode': second_brain.get("graph_extraction_mode", "heuristic_fallback"),
+        'memory_consolidation_enabled': second_brain.get("memory_consolidation_enabled", True),
+        'memory_decay_days': second_brain.get("memory_decay_days", 90),
+        'db_primary_strict': second_brain.get("db_primary_strict", True),
+        'ingestion_embedding_batch_size': second_brain.get("ingestion_embedding_batch_size", 64),
+        'ingestion_max_workers': second_brain.get("ingestion_max_workers", 4),
+        'postgres_dsn': postgres_dsn,
+        'pgvector_embedding_dim': storage_cfg.get("pgvector_embedding_dim", 384),
+        'neo4j_uri': neo4j_uri,
+        'neo4j_user': neo4j_user,
+        'neo4j_password': neo4j_password,
     }
 
 def initialize_session_state():
@@ -207,12 +274,14 @@ def initialize_session_state():
     if 'selected_documents' not in st.session_state:
         st.session_state.selected_documents = []
     
-    # Auto-loading activat implicit pentru experiență production-ready
-    if 'auto_load_enabled' not in st.session_state:
-        st.session_state.auto_load_enabled = True
-    
-    if 'auto_load_attempted' not in st.session_state:
-        st.session_state.auto_load_attempted = False
+    if 'startup_bootstrap_done' not in st.session_state:
+        st.session_state.startup_bootstrap_done = False
+
+    if 'documents_bootstrap_source' not in st.session_state:
+        st.session_state.documents_bootstrap_source = "unknown"
+
+    if 'last_sync_summary' not in st.session_state:
+        st.session_state.last_sync_summary = {}
 
     if 'query_mode' not in st.session_state:
         st.session_state.query_mode = "topic_general"
@@ -223,8 +292,22 @@ def initialize_session_state():
     if 'upload_collection' not in st.session_state:
         st.session_state.upload_collection = GENERAL_COLLECTION_NAME
 
-def get_chat_manager() -> Optional["ChatSessionManager"]:
-    """Return chat session manager if available."""
+def get_chat_manager():
+    """Return DB chat manager when storage is healthy, otherwise file-based fallback."""
+    apci_system = st.session_state.get("apci_system")
+    repository = getattr(apci_system, "repository", None) if apci_system else None
+    if repository and getattr(repository, "enabled", False):
+        try:
+            if repository.is_healthy():
+                return repository
+        except Exception:
+            pass
+
+    manager = st.session_state.get("chat_manager")
+    return manager if CHAT_SESSION_MANAGER_AVAILABLE else None
+
+def get_local_chat_manager() -> Optional["ChatSessionManager"]:
+    """Return local file-based chat manager if available."""
     manager = st.session_state.get("chat_manager")
     return manager if CHAT_SESSION_MANAGER_AVAILABLE else None
 
@@ -249,6 +332,8 @@ def ensure_active_chat_session() -> None:
             topic_collection=st.session_state.get("active_topic_collection", ""),
             query_mode=st.session_state.get("query_mode", "topic_general"),
         )
+        if not created or not created.get("id"):
+            return
         st.session_state.active_chat_id = created["id"]
         st.session_state.chat_history = []
         st.session_state.chat_title_draft = created.get("title", DEFAULT_CHAT_TITLE)
@@ -325,7 +410,8 @@ def create_and_switch_chat(
         topic_collection=topic_collection if topic_collection is not None else st.session_state.get("active_topic_collection", ""),
         query_mode=query_mode if query_mode is not None else st.session_state.get("query_mode", "topic_general"),
     )
-    switch_active_chat(created["id"])
+    if created and created.get("id"):
+        switch_active_chat(created["id"])
 
 def delete_active_chat() -> None:
     """Delete active chat and fallback to another one."""
@@ -341,95 +427,283 @@ def delete_active_chat() -> None:
     st.session_state.active_chat_id = ""
     ensure_active_chat_session()
 
-def auto_load_library_documents():
+def ensure_apci_system(api_key: str):
+    """Inițializează APCI o singură dată și îl returnează."""
+    if not RAG_MODULE_AVAILABLE:
+        return None
+
+    if st.session_state.apci_system:
+        return st.session_state.apci_system
+
+    config = load_config()
+    config_dict = build_apci_config_dict(config)
+    st.session_state.apci_system = create_apci_system(api_key, config_dict)
+    return st.session_state.apci_system
+
+def collect_library_payload(doc_ids: List[str]) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, str]]:
+    """Construiește payload-ul (paths + metadata) pentru documentele din bibliotecă."""
+    file_paths: List[str] = []
+    metadata_by_path: Dict[str, Dict[str, Any]] = {}
+    path_to_doc_id: Dict[str, str] = {}
+    unique_paths = set()
+
+    for doc_id in doc_ids:
+        file_path = st.session_state.document_manager.get_document_file_path(doc_id)
+        doc_info = st.session_state.document_manager.get_document_info(doc_id)
+        if not file_path or not file_path.exists() or not doc_info:
+            continue
+
+        resolved_path = str(file_path.resolve())
+        if resolved_path in unique_paths:
+            continue
+
+        unique_paths.add(resolved_path)
+        file_paths.append(resolved_path)
+        path_to_doc_id[resolved_path] = doc_id
+        metadata_by_path[resolved_path] = build_metadata_entry(doc_id, doc_info, file_path)
+
+    return file_paths, metadata_by_path, path_to_doc_id
+
+def bootstrap_documents_from_storage(api_key: str) -> None:
     """
-    Încarcă automat toate documentele din bibliotecă la pornirea aplicației
-    pentru o experiență production-ready și intuitivă
+    Startup rapid: inițializează sistemul și citește statusul indexului din DB.
+    Nu rulează ingestie la pornire.
     """
-    if not DOCUMENT_MANAGER_AVAILABLE or not st.session_state.document_manager:
-        return False
-    
-    # Verifică dacă auto-loading este activat și nu a fost deja încercat
-    if not st.session_state.get('auto_load_enabled', True):
-        return False
-        
-    if st.session_state.get('auto_load_attempted', False):
-        return False
-    
-    # Verifică dacă există API key
-    api_key = os.getenv('GOOGLE_API_KEY', '')
-    if not api_key:
-        return False
-    
-    # Verifică dacă există documente în bibliotecă
-    stats = st.session_state.document_manager.get_library_stats()
-    if stats.get('total_documents', 0) == 0:
-        st.session_state.auto_load_attempted = True
-        return False
-    
-    # Marcăm că am încercat auto-loading-ul
-    st.session_state.auto_load_attempted = True
-    
+    if st.session_state.get("startup_bootstrap_done", False):
+        return
+
+    st.session_state.startup_bootstrap_done = True
+
     try:
-        # Obține toate documentele din bibliotecă
-        all_docs = st.session_state.document_manager.get_all_documents()
-        doc_ids = list(all_docs.keys())
-        
-        if not doc_ids:
-            return False
-        
-        with st.spinner("Auto-loading: Încarcă bibliotecă completă pentru experiență optimă..."):
-            # Inițializează sistemul APCI dacă nu există
-            if not st.session_state.apci_system:
-                config = load_config()
-                config_dict = build_apci_config_dict(config)
-                st.session_state.apci_system = create_apci_system(api_key, config_dict)
-            
-            # Obține căile fișierelor din bibliotecă
-            file_paths = []
-            loaded_docs = []
-            metadata_by_path = {}
-            
-            for doc_id in doc_ids:
-                file_path = st.session_state.document_manager.get_document_file_path(doc_id)
-                doc_info = st.session_state.document_manager.get_document_info(doc_id)
-                
-                if file_path and file_path.exists() and doc_info:
-                    resolved_path = str(file_path.resolve())
-                    file_paths.append(resolved_path)
-                    loaded_docs.append(doc_info['original_name'])
-                    metadata_by_path[resolved_path] = build_metadata_entry(doc_id, doc_info, file_path)
-            
-            if file_paths:
-                # Procesează documentele
-                success = st.session_state.apci_system.load_documents(
-                    file_paths,
-                    metadata_by_path=metadata_by_path
+        apci_system = ensure_apci_system(api_key)
+        if not apci_system:
+            st.session_state.documents_loaded = False
+            st.session_state.documents_bootstrap_source = "apci_unavailable"
+            return
+
+        storage_status = apci_system.get_storage_index_status()
+        indexed_chunks = int(storage_status.get("indexed_chunks", 0) or 0)
+        indexed_documents = int(storage_status.get("indexed_documents", 0) or 0)
+        postgres_enabled = bool(storage_status.get("postgres_enabled", False))
+
+        st.session_state.last_sync_summary = {
+            "indexed_documents": indexed_documents,
+            "indexed_chunks": indexed_chunks,
+            "last_sync_at": storage_status.get("last_sync_at"),
+            "storage_mode": storage_status.get("storage_mode", "local_fallback"),
+            "db_primary_strict": bool(storage_status.get("db_primary_strict", False)),
+            "bootstrap": True,
+        }
+
+        if postgres_enabled and indexed_chunks > 0:
+            st.session_state.documents_loaded = True
+            st.session_state.documents_bootstrap_source = "db_bootstrap"
+        elif postgres_enabled:
+            st.session_state.documents_loaded = False
+            st.session_state.documents_bootstrap_source = "db_empty"
+        else:
+            st.session_state.documents_loaded = False
+            st.session_state.documents_bootstrap_source = "local_pending"
+
+        update_system_status()
+    except Exception as exc:
+        logger.error("Eroare la bootstrap din storage: %s", exc)
+        st.session_state.documents_loaded = False
+        st.session_state.documents_bootstrap_source = "bootstrap_error"
+
+def sync_library_to_db(api_key: str, doc_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Sync manual biblioteca -> index intern (DB primary, delta-only când DB este disponibilă).
+    """
+    result = {
+        "success": False,
+        "ingested": 0,
+        "skipped": 0,
+        "total_candidates": 0,
+        "message": "",
+    }
+
+    if not DOCUMENT_MANAGER_AVAILABLE or not st.session_state.document_manager:
+        result["message"] = "Biblioteca locală nu este disponibilă."
+        return result
+
+    if not RAG_MODULE_AVAILABLE:
+        result["message"] = "Modulul RAG nu este disponibil."
+        return result
+
+    try:
+        apci_system = ensure_apci_system(api_key)
+        if not apci_system:
+            result["message"] = "Nu s-a putut inițializa APCI."
+            return result
+
+        if doc_ids is None:
+            all_docs = st.session_state.document_manager.get_all_documents()
+            doc_ids = list(all_docs.keys())
+
+        file_paths, metadata_by_path, path_to_doc_id = collect_library_payload(doc_ids)
+        result["total_candidates"] = len(file_paths)
+        if not file_paths:
+            result["message"] = "Nu există documente valide pentru sync."
+            st.session_state.last_sync_summary = {
+                "indexed_documents": 0,
+                "indexed_chunks": 0,
+                "last_sync_at": None,
+                "storage_mode": "unknown",
+                "bootstrap": False,
+            }
+            return result
+
+        filtered = apci_system.filter_paths_for_ingestion(
+            file_paths,
+            metadata_by_path=metadata_by_path,
+        )
+        to_ingest = filtered.get("to_ingest", [])
+        already_indexed = filtered.get("already_indexed", [])
+        result["ingested"] = len(to_ingest)
+        result["skipped"] = len(already_indexed)
+
+        for indexed_path in already_indexed:
+            doc_id = path_to_doc_id.get(indexed_path)
+            if doc_id:
+                st.session_state.document_manager.mark_document_indexed(doc_id)
+
+        if to_ingest:
+            ingest_metadata = {path: metadata_by_path[path] for path in to_ingest if path in metadata_by_path}
+            success = apci_system.load_documents(to_ingest, metadata_by_path=ingest_metadata)
+            if not success:
+                result["message"] = "Eroare la ingestia documentelor în index."
+                return result
+
+            for ingested_path in to_ingest:
+                doc_id = path_to_doc_id.get(ingested_path)
+                if doc_id:
+                    st.session_state.document_manager.mark_document_indexed(doc_id)
+
+        storage_status = apci_system.get_storage_index_status()
+        st.session_state.last_sync_summary = {
+            "indexed_documents": storage_status.get("indexed_documents", 0),
+            "indexed_chunks": storage_status.get("indexed_chunks", 0),
+            "last_sync_at": storage_status.get("last_sync_at"),
+            "storage_mode": storage_status.get("storage_mode", "local_fallback"),
+            "db_primary_strict": bool(storage_status.get("db_primary_strict", False)),
+            "bootstrap": False,
+        }
+
+        st.session_state.documents_loaded = bool(
+            int(storage_status.get("indexed_chunks", 0) or 0) > 0
+            or len(already_indexed) > 0
+            or len(to_ingest) > 0
+        )
+        st.session_state.documents_bootstrap_source = "manual_sync"
+        update_system_status()
+
+        result["success"] = True
+        if to_ingest:
+            result["message"] = f"Sync finalizat: {len(to_ingest)} ingestate, {len(already_indexed)} deja indexate."
+        else:
+            result["message"] = f"Nimic de ingestat. {len(already_indexed)} documente sunt deja indexate."
+        return result
+    except Exception as exc:
+        logger.error("Eroare la sync biblioteca -> DB: %s", exc)
+        result["message"] = f"Eroare la sync: {exc}"
+        return result
+
+def migrate_local_chats_to_db(api_key: str) -> Dict[str, Any]:
+    """
+    Migrare one-time a chat-urilor locale (JSON) în Postgres.
+    """
+    result = {
+        "success": False,
+        "migrated": 0,
+        "failed": 0,
+        "total_candidates": 0,
+        "message": "",
+    }
+
+    local_manager = get_local_chat_manager()
+    if not local_manager:
+        result["message"] = "Nu există chat manager local pentru migrare."
+        return result
+
+    apci_system = ensure_apci_system(api_key)
+    repository = getattr(apci_system, "repository", None) if apci_system else None
+    if not repository or not getattr(repository, "enabled", False):
+        result["message"] = "Storage Postgres nu este activ."
+        return result
+
+    try:
+        if not repository.is_healthy():
+            result["message"] = "Conexiunea la Postgres nu este disponibilă."
+            return result
+    except Exception as exc:
+        result["message"] = f"Conexiunea la Postgres a eșuat: {exc}"
+        return result
+
+    try:
+        candidates = local_manager.list_sessions(include_migrated=False)
+        result["total_candidates"] = len(candidates)
+        if not candidates:
+            result["success"] = True
+            result["message"] = "Nu există chat-uri locale de migrat."
+            return result
+
+        failed_ids: List[str] = []
+        for session_summary in candidates:
+            session_id = session_summary.get("id", "")
+            if not session_id:
+                continue
+
+            session_data = local_manager.load_session(session_id)
+            if not session_data:
+                failed_ids.append(session_id)
+                continue
+
+            created = repository.create_session(
+                title=session_data.get("title", DEFAULT_CHAT_TITLE),
+                topic_collection=session_data.get("topic_collection", ""),
+                query_mode=session_data.get("query_mode", "topic_general"),
+            )
+            db_session_id = created.get("id") if created else ""
+            if not db_session_id:
+                failed_ids.append(session_id)
+                continue
+
+            messages = session_data.get("messages", [])
+            migrated_ok = True
+            for exchange in messages:
+                if not repository.append_exchange(db_session_id, exchange):
+                    migrated_ok = False
+                    break
+
+            if migrated_ok:
+                repository.save_session(
+                    db_session_id,
+                    messages=[],
+                    title=session_data.get("title", DEFAULT_CHAT_TITLE),
+                    topic_collection=session_data.get("topic_collection", ""),
+                    query_mode=session_data.get("query_mode", "topic_general"),
                 )
-                
-                if success:
-                    st.session_state.documents_loaded = True
-                    
-                    # Marchează documentele ca indexate în bibliotecă
-                    for doc_id in doc_ids:
-                        st.session_state.document_manager.mark_document_indexed(doc_id)
-                    
-                    # Actualizează statusul
-                    update_system_status()
-                    
-                    # Afișează notificare de succes
-                    st.success(f"Auto-loading complet! {len(file_paths)} documente din bibliotecă sunt acum disponibile pentru chat.")
-                    return True
-                else:
-                    st.warning("Auto-loading parțial: Unele documente nu au putut fi procesate")
-                    return False
+                local_manager.mark_session_migrated(session_id, db_session_id=db_session_id)
+                result["migrated"] += 1
             else:
-                st.info("Biblioteca este goală - documentele vor fi încărcate automat când vor fi adăugate")
-                return False
-                
-    except Exception as e:
-        st.error(f"Eroare la auto-loading: {e}")
-        return False
+                repository.delete_session(db_session_id)
+                failed_ids.append(session_id)
+
+        result["failed"] = len(failed_ids)
+        result["success"] = result["failed"] == 0
+        if result["success"]:
+            result["message"] = f"Migrare completă: {result['migrated']} chat-uri migrate în Postgres."
+        else:
+            result["message"] = (
+                f"Migrare parțială: {result['migrated']} migrate, "
+                f"{result['failed']} eșuate."
+            )
+        return result
+    except Exception as exc:
+        logger.error("Eroare la migrarea chat-urilor locale în Postgres: %s", exc)
+        result["message"] = f"Eroare la migrare: {exc}"
+        return result
 
 def setup_sidebar():
     """Configurează bara laterală"""
@@ -459,6 +733,21 @@ def setup_sidebar():
         # Conversații persistente
         st.subheader("Conversații")
         chat_manager = get_chat_manager()
+        local_chat_manager = get_local_chat_manager()
+
+        if chat_manager and hasattr(chat_manager, "is_healthy") and local_chat_manager and api_key:
+            pending_local_sessions = local_chat_manager.list_sessions(include_migrated=False)
+            if pending_local_sessions:
+                st.info(f"Există {len(pending_local_sessions)} chat-uri locale nemigrate.")
+                if st.button("Migrează chat-urile locale în Postgres", use_container_width=True):
+                    with st.spinner("Migrez chat-urile locale în Postgres..."):
+                        migration_result = migrate_local_chats_to_db(api_key)
+                    if migration_result.get("success"):
+                        st.success(migration_result.get("message", "Migrare finalizată."))
+                    else:
+                        st.warning(migration_result.get("message", "Migrare parțială/eșuată."))
+                    st.rerun()
+
         if chat_manager:
             ensure_active_chat_session()
             sessions = chat_manager.list_sessions()
@@ -504,7 +793,11 @@ def setup_sidebar():
         else:
             st.warning("Persistența chat-urilor nu este disponibilă.")
 
-        st.caption("Stocare chat-uri: data/chat_sessions/")
+        active_chat_manager = get_chat_manager()
+        if active_chat_manager and hasattr(active_chat_manager, "is_healthy"):
+            st.caption("Stocare chat-uri: Postgres")
+        else:
+            st.caption("Stocare chat-uri: data/chat_sessions/")
         st.divider()
         
         # Încărcare documente
@@ -543,16 +836,29 @@ def setup_sidebar():
             with col2:
                 st.metric("Colecții", stats.get("total_collections", 0))
             
-            # Indicator stare auto-loading
-            if st.session_state.get('auto_load_enabled', True):
-                if st.session_state.get('documents_loaded', False):
-                    st.success("Auto-loading: Biblioteca încărcată!")
-                elif stats.get("total_documents", 0) > 0:
-                    st.info("Auto-loading: Gata să încarce...")
+            # Indicator stare bootstrap/sync
+            if st.session_state.get("documents_loaded", False):
+                source = st.session_state.get("documents_bootstrap_source", "unknown")
+                if source == "db_bootstrap":
+                    st.success("Startup rapid: context disponibil din DB.")
+                elif source == "manual_sync":
+                    st.success("Context actualizat prin sync manual.")
                 else:
-                    st.info("Auto-loading: Bibliotecă goală")
+                    st.success("Context disponibil.")
+            elif stats.get("total_documents", 0) > 0:
+                st.warning("DB nu are index disponibil. Rulează sync manual.")
             else:
-                st.warning("Auto-loading dezactivat")
+                st.info("Biblioteca este goală.")
+
+            if api_key and stats.get("total_documents", 0) > 0:
+                if st.button("Sync biblioteca în DB", type="secondary", use_container_width=True):
+                    with st.spinner("Sincronizez biblioteca în DB..."):
+                        sync_result = sync_library_to_db(api_key)
+                    if sync_result.get("success"):
+                        st.success(sync_result.get("message", "Sync finalizat."))
+                    else:
+                        st.error(sync_result.get("message", "Sync eșuat."))
+                    st.rerun()
             
             # Buton pentru a deschide biblioteca completă
             if st.button("Deschide Biblioteca", type="secondary"):
@@ -587,29 +893,25 @@ def setup_sidebar():
         with st.expander("Configurări Avansate"):
             config = load_config()
             
-            # Auto-loading Settings
-            st.subheader("Auto-Loading Bibliotecă")
-            
-            auto_load_enabled = st.checkbox(
-                "Încărcare automată la pornire",
-                value=st.session_state.get('auto_load_enabled', True),
-                help="Încarcă automat toate documentele din bibliotecă la pornirea aplicației pentru o experiență production-ready"
-            )
-            
-            if auto_load_enabled != st.session_state.get('auto_load_enabled', True):
-                st.session_state.auto_load_enabled = auto_load_enabled
-                st.session_state.auto_load_attempted = False  # Reset pentru a permite re-loading
-            
-            if not auto_load_enabled and st.session_state.get('documents_loaded', False):
-                st.info("Auto-loading dezactivat. Documentele rămân încărcate în sesiunea curentă.")
-            
-            # Manual trigger pentru auto-loading
-            if not st.session_state.get('documents_loaded', False) and api_key:
-                if st.button("Forțează Auto-Loading Acum", type="secondary"):
-                    st.session_state.auto_load_attempted = False
-                    auto_load_library_documents()
-                    st.rerun()
-            
+            st.subheader("Startup & Storage")
+            storage_summary = st.session_state.get("last_sync_summary", {})
+            if storage_summary:
+                col_storage_1, col_storage_2 = st.columns(2)
+                with col_storage_1:
+                    st.metric("DB docs indexate", int(storage_summary.get("indexed_documents", 0) or 0))
+                    st.metric("DB chunks indexate", int(storage_summary.get("indexed_chunks", 0) or 0))
+                with col_storage_2:
+                    st.write(f"Storage mode: `{storage_summary.get('storage_mode', 'unknown')}`")
+                    strict_mode = bool(storage_summary.get("db_primary_strict", False))
+                    st.caption(f"DB primary strict: {'ON' if strict_mode else 'OFF'}")
+                    last_sync_at = storage_summary.get("last_sync_at")
+                    if last_sync_at:
+                        st.caption(f"Ultimul sync: {last_sync_at}")
+                    else:
+                        st.caption("Nu există sync anterior.")
+            else:
+                st.caption("Status storage indisponibil.")
+
             st.divider()
             
             # Model selection
@@ -706,24 +1008,18 @@ def process_documents(uploaded_files, api_key: str, target_collection: str = GEN
         return
     
     try:
-        # Inițializează sistemul APCI doar dacă nu există
-        if not st.session_state.apci_system:
-            with st.spinner("🔄 Inițializez sistemul APCI..."):
-                # Configurație pentru sistem - folosește configurația globală
-                config = load_config()
-                config_dict = build_apci_config_dict(config)
-                
-                # Creează sistemul APCI
-                st.session_state.apci_system = create_apci_system(api_key, config_dict)
-        else:
-            st.info("📚 Adaug documente noi la biblioteca existentă...")
+        with st.spinner("🔄 Inițializez sistemul APCI..."):
+            apci_system = ensure_apci_system(api_key)
+        if not apci_system:
+            st.error("❌ Nu s-a putut inițializa sistemul APCI.")
+            return
         
         # Salvează fișierele temporar
         temp_dir = Path("./data/uploaded_docs")
         temp_dir.mkdir(parents=True, exist_ok=True)
         
         file_paths = []
-        doc_ids = []
+        path_to_doc_id: Dict[str, str] = {}
         metadata_by_path = {}
         unique_paths = set()
         target_collection = normalize_collection_name(target_collection)
@@ -745,7 +1041,6 @@ def process_documents(uploaded_files, api_key: str, target_collection: str = GEN
                         description=f"Încărcat la {time.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                     if doc_id:
-                        doc_ids.append(doc_id)
                         doc_info = st.session_state.document_manager.get_document_info(doc_id)
                         library_file_path = st.session_state.document_manager.get_document_file_path(doc_id)
 
@@ -754,6 +1049,7 @@ def process_documents(uploaded_files, api_key: str, target_collection: str = GEN
                             if resolved_path not in unique_paths:
                                 unique_paths.add(resolved_path)
                                 file_paths.append(resolved_path)
+                            path_to_doc_id[resolved_path] = doc_id
                             metadata_by_path[resolved_path] = build_metadata_entry(
                                 doc_id,
                                 doc_info,
@@ -765,6 +1061,7 @@ def process_documents(uploaded_files, api_key: str, target_collection: str = GEN
                     if resolved_path not in unique_paths:
                         unique_paths.add(resolved_path)
                         file_paths.append(resolved_path)
+                    path_to_doc_id[resolved_path] = ""
                     metadata_by_path[resolved_path] = {
                         "filename": uploaded_file.name,
                         "file_type": Path(uploaded_file.name).suffix,
@@ -776,27 +1073,49 @@ def process_documents(uploaded_files, api_key: str, target_collection: str = GEN
         if not file_paths:
             st.error("❌ Nu există documente valide pentru procesare")
             return
+
+        filtered = apci_system.filter_paths_for_ingestion(
+            file_paths,
+            metadata_by_path=metadata_by_path,
+        )
+        to_ingest = filtered.get("to_ingest", [])
+        already_indexed = filtered.get("already_indexed", [])
+
+        for existing_path in already_indexed:
+            existing_doc_id = path_to_doc_id.get(existing_path)
+            if existing_doc_id and DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
+                st.session_state.document_manager.mark_document_indexed(existing_doc_id)
         
-        # Procesează documentele
-        with st.spinner("🧠 Procesez și indexez documentele..."):
-            success = st.session_state.apci_system.load_documents(
-                file_paths,
-                metadata_by_path=metadata_by_path
-            )
-            
-            if success:
-                st.session_state.documents_loaded = True
-                st.success(f"✅ {len(file_paths)} documente procesate cu succes!")
-                
-                # Marchează documentele ca indexate în bibliotecă
-                if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
-                    for doc_id in doc_ids:
-                        st.session_state.document_manager.mark_document_indexed(doc_id)
-                
-                # Actualizează statusul
-                update_system_status()
+        if to_ingest:
+            ingest_metadata = {path: metadata_by_path[path] for path in to_ingest if path in metadata_by_path}
+            with st.spinner("🧠 Procesez și indexez documentele noi..."):
+                success = apci_system.load_documents(
+                    to_ingest,
+                    metadata_by_path=ingest_metadata
+                )
+        else:
+            success = True
+
+        if success:
+            st.session_state.documents_loaded = True
+            st.session_state.documents_bootstrap_source = "manual_sync"
+
+            # Marchează documentele ca indexate în bibliotecă
+            if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
+                indexed_paths = set(to_ingest).union(set(already_indexed))
+                for indexed_path in indexed_paths:
+                    indexed_doc_id = path_to_doc_id.get(indexed_path)
+                    if indexed_doc_id:
+                        st.session_state.document_manager.mark_document_indexed(indexed_doc_id)
+
+            # Actualizează statusul
+            update_system_status()
+            if to_ingest:
+                st.success(f"✅ {len(to_ingest)} documente procesate; {len(already_indexed)} deja indexate.")
             else:
-                st.error("❌ Eroare la procesarea documentelor")
+                st.success(f"✅ Toate documentele ({len(already_indexed)}) erau deja indexate.")
+        else:
+            st.error("❌ Eroare la procesarea documentelor")
     
     except Exception as e:
         st.error(f"❌ Eroare: {str(e)}")
@@ -809,64 +1128,14 @@ def load_documents_from_library(doc_ids: List[str], api_key: str):
         return
     
     try:
-        # Inițializează sistemul APCI doar dacă nu există
-        if not st.session_state.apci_system:
-            with st.spinner("🔄 Inițializez sistemul APCI..."):
-                # Configurație pentru sistem - folosește configurația globală
-                config = load_config()
-                config_dict = build_apci_config_dict(config)
-                
-                # Creează sistemul APCI
-                st.session_state.apci_system = create_apci_system(api_key, config_dict)
+        with st.spinner("📚 Sincronizez documentele selectate..."):
+            sync_result = sync_library_to_db(api_key, doc_ids=doc_ids)
+
+        if sync_result.get("success"):
+            st.success(sync_result.get("message", "Documentele au fost sincronizate."))
+            st.rerun()
         else:
-            st.info("📚 Adaug documente din bibliotecă la sistema curentă...")
-        
-        # Obține căile fișierelor din bibliotecă
-        file_paths = []
-        doc_names = []
-        metadata_by_path = {}
-        unique_paths = set()
-        
-        with st.spinner("📚 Încarcă din bibliotecă..."):
-            for doc_id in doc_ids:
-                file_path = st.session_state.document_manager.get_document_file_path(doc_id)
-                doc_info = st.session_state.document_manager.get_document_info(doc_id)
-                
-                if file_path and file_path.exists() and doc_info:
-                    resolved_path = str(file_path.resolve())
-                    if resolved_path not in unique_paths:
-                        unique_paths.add(resolved_path)
-                        file_paths.append(resolved_path)
-                    doc_names.append(doc_info['original_name'])
-                    metadata_by_path[resolved_path] = build_metadata_entry(doc_id, doc_info, file_path)
-                    st.write(f"✅ Găsit: {doc_info['original_name']}")
-                else:
-                    st.warning(f"⚠️ Documentul {doc_id} nu a fost găsit")
-        
-        if not file_paths:
-            st.error("❌ Nu s-au găsit documente valide")
-            return
-        
-        # Procesează documentele
-        with st.spinner("🧠 Procesez și indexez documentele..."):
-            success = st.session_state.apci_system.load_documents(
-                file_paths,
-                metadata_by_path=metadata_by_path
-            )
-            
-            if success:
-                st.session_state.documents_loaded = True
-                st.success(f"✅ {len(file_paths)} documente încărcate din bibliotecă!")
-                
-                # Marchează documentele ca indexate în bibliotecă
-                for doc_id in doc_ids:
-                    st.session_state.document_manager.mark_document_indexed(doc_id)
-                
-                # Actualizează statusul
-                update_system_status()
-                st.rerun()
-            else:
-                st.error("❌ Eroare la procesarea documentelor")
+            st.error(sync_result.get("message", "Eroare la sincronizare."))
     
     except Exception as e:
         st.error(f"❌ Eroare: {str(e)}")
@@ -876,7 +1145,18 @@ def update_system_status():
     """Actualizează statusul sistemului"""
     if st.session_state.apci_system:
         try:
-            st.session_state.system_stats = st.session_state.apci_system.get_system_status()
+            status = st.session_state.apci_system.get_system_status()
+            st.session_state.system_stats = status
+
+            storage_status = status.get("storage_index_status", {})
+            if storage_status:
+                st.session_state.last_sync_summary = {
+                    "indexed_documents": storage_status.get("indexed_documents", 0),
+                    "indexed_chunks": storage_status.get("indexed_chunks", 0),
+                    "last_sync_at": storage_status.get("last_sync_at"),
+                    "storage_mode": storage_status.get("storage_mode", "local_fallback"),
+                    "bootstrap": st.session_state.last_sync_summary.get("bootstrap", False),
+                }
         except Exception as e:
             st.error(f"Eroare la obținerea statusului: {e}")
 
@@ -915,6 +1195,12 @@ def display_system_status():
     if rate_stats:
         st.write(f"**Requests/min**: {rate_stats.get('minute_requests', 0)}")
 
+    storage_status = stats.get("storage_index_status", {})
+    if storage_status:
+        st.write(f"**Storage mode**: {storage_status.get('storage_mode', 'unknown')}")
+        st.write(f"**DB indexed docs**: {storage_status.get('indexed_documents', 0)}")
+        st.write(f"**DB indexed chunks**: {storage_status.get('indexed_chunks', 0)}")
+
 def main_chat_interface():
     """Interfața principală de chat"""
     # Verifică dacă sistemul este gata
@@ -925,7 +1211,7 @@ def main_chat_interface():
         if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
             stats = st.session_state.document_manager.get_library_stats()
             if stats.get('total_documents', 0) > 0:
-                st.info("🚀 Configurează API key-ul în bara laterală. Documentele din bibliotecă vor fi încărcate automat!")
+                st.info("🚀 Configurează API key-ul, apoi rulează sync manual biblioteca -> DB.")
             else:
                 st.info("👈 Configurează API key-ul și încarcă documente în bara laterală pentru a începe.")
         else:
@@ -945,7 +1231,7 @@ def main_chat_interface():
                 if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
                     stats = st.session_state.document_manager.get_library_stats()
                     if stats.get('total_documents', 0) > 0:
-                        st.info("Configurează API key-ul mai întâi. Documentele din bibliotecă vor fi încărcate automat!")
+                        st.info("Configurează API key-ul mai întâi, apoi rulează sync manual biblioteca -> DB.")
                     else:
                         st.info("Încarcă documente mai întâi pentru a primi răspunsuri personalizate!")
                 else:
@@ -955,20 +1241,35 @@ def main_chat_interface():
     
     if not st.session_state.documents_loaded:
         st.title("🧠 APCI - Asistentul Personalizat de Cercetare și Învățare")
-        
-        # Verifică dacă auto-loading este activat
-        if st.session_state.get('auto_load_enabled', True):
-            if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
-                stats = st.session_state.document_manager.get_library_stats()
-                if stats.get('total_documents', 0) > 0:
-                    st.info("🔄 Auto-loading în progres... Documentele din bibliotecă vor fi disponibile în curând!")
-                else:
-                    st.warning("📚 Biblioteca este goală. Încarcă documente pentru a începe conversația!")
-            else:
-                st.warning("📚 Încarcă documente pentru a începe conversația!")
+
+        bootstrap_source = st.session_state.get("documents_bootstrap_source", "unknown")
+        if bootstrap_source == "db_empty":
+            st.warning("DB este conectată, dar indexul este gol.")
+        elif bootstrap_source == "local_pending":
+            st.warning("Storage DB nu este activă. Poți folosi ingestia locală manuală.")
+        elif bootstrap_source == "bootstrap_error":
+            st.error("Bootstrap din DB a eșuat. Verifică conexiunea la Postgres.")
         else:
-            st.warning("📚 Auto-loading dezactivat. Încarcă manual documente pentru a începe conversația!")
-        
+            st.info("Nu există context indexat disponibil.")
+
+        if DOCUMENT_MANAGER_AVAILABLE and st.session_state.document_manager:
+            stats = st.session_state.document_manager.get_library_stats()
+            if stats.get('total_documents', 0) > 0:
+                st.info("Biblioteca locală are documente. Rulează sync manual pentru a le indexa în DB.")
+                api_key = os.getenv('GOOGLE_API_KEY', '')
+                if api_key and st.button("Sync biblioteca în DB", type="primary"):
+                    with st.spinner("Sincronizez biblioteca în DB..."):
+                        sync_result = sync_library_to_db(api_key)
+                    if sync_result.get("success"):
+                        st.success(sync_result.get("message", "Sync finalizat."))
+                    else:
+                        st.error(sync_result.get("message", "Sync eșuat."))
+                    st.rerun()
+            else:
+                st.warning("📚 Biblioteca este goală. Încarcă documente pentru a începe conversația.")
+        else:
+            st.warning("📚 Încarcă documente pentru a începe conversația.")
+
         return
     
     st.title("🧠 APCI - Chat")
@@ -1032,6 +1333,55 @@ def main_chat_interface():
                 chat_manager.clear_session(active_chat_id)
             st.rerun()
 
+    if st.session_state.apci_system and hasattr(st.session_state.apci_system, "get_second_brain_status"):
+        second_brain_status = st.session_state.apci_system.get_second_brain_status()
+        with st.expander("Second Brain status", expanded=False):
+            db_status = second_brain_status.get("db", {})
+            local_status = second_brain_status.get("local", {})
+            col_sb1, col_sb2, col_sb3 = st.columns(3)
+            with col_sb1:
+                st.metric("DB task-uri deschise", int(db_status.get("tasks_open_count", 0) or 0))
+                st.metric("DB decizii", int(db_status.get("decisions_count", 0) or 0))
+            with col_sb2:
+                st.metric("Local task-uri", int(local_status.get("open_tasks", 0) or 0))
+                st.metric("Local memorii", int(local_status.get("episodes", 0) or 0))
+            with col_sb3:
+                st.caption(f"Consolidare memorie: {'ON' if second_brain_status.get('memory_consolidation_enabled') else 'OFF'}")
+                st.caption(f"Memory decay: {second_brain_status.get('memory_decay_days', 0)} zile")
+                st.caption(f"Ultima consolidare: {second_brain_status.get('last_memory_consolidation_at') or 'N/A'}")
+
+    if st.session_state.apci_system and hasattr(st.session_state.apci_system, "list_tasks"):
+        active_collection_for_tasks = st.session_state.get("active_topic_collection", "") or None
+        task_items = st.session_state.apci_system.list_tasks(
+            active_collection=active_collection_for_tasks,
+            limit=15,
+        )
+        with st.expander("Task-uri si remindere", expanded=False):
+            if not task_items:
+                st.caption("Nu exista task-uri active.")
+            else:
+                for task in task_items:
+                    task_id = task.get("id")
+                    title = task.get("title", "Task")
+                    status_value = task.get("status", "open")
+                    topic_value = task.get("topic_collection", "") or "general"
+                    st.write(f"**{title}**")
+                    st.caption(f"status={status_value} - topic={topic_value}")
+                    col_task1, col_task2, col_task3 = st.columns(3)
+                    with col_task1:
+                        if st.button("Open", key=f"task_open_{task_id}", use_container_width=True):
+                            if st.session_state.apci_system.update_task_status(task_id, "open"):
+                                st.rerun()
+                    with col_task2:
+                        if st.button("In progress", key=f"task_progress_{task_id}", use_container_width=True):
+                            if st.session_state.apci_system.update_task_status(task_id, "in_progress"):
+                                st.rerun()
+                    with col_task3:
+                        if st.button("Done", key=f"task_done_{task_id}", use_container_width=True):
+                            if st.session_state.apci_system.update_task_status(task_id, "done"):
+                                st.rerun()
+                    st.divider()
+
     st.subheader("💬 Conversație")
     if not st.session_state.chat_history:
         st.info("Chatul este gol. Pune prima întrebare pentru acest topic.")
@@ -1054,6 +1404,30 @@ def main_chat_interface():
                         collection = source.get("collection", GENERAL_COLLECTION_NAME)
                         st.write(f"{j}. **{filename}** ({collection})")
 
+            if chat.get("graph_sources"):
+                with st.expander("🕸️ Surse Graph"):
+                    for j, source in enumerate(chat["graph_sources"], 1):
+                        concept = source.get("concept", f"Concept {j}")
+                        filename = source.get("filename", "N/A")
+                        citation = source.get("citation", f"G{j}")
+                        st.write(f"{citation}. **{concept}** -> {filename}")
+
+            if chat.get("memory_hits"):
+                with st.expander("🧠 Memory Hits"):
+                    for j, item in enumerate(chat["memory_hits"], 1):
+                        title = item.get("title", f"Memory {j}")
+                        topic = item.get("topic_collection", "")
+                        memory_type = item.get("memory_type", "semantic")
+                        st.write(f"{j}. **[{memory_type}] {title}** ({topic})")
+
+            if chat.get("provenance"):
+                with st.expander("🔎 Proveniență"):
+                    for entry in chat["provenance"]:
+                        citation = entry.get("citation", "?")
+                        kind = entry.get("kind", "")
+                        score = entry.get("score", 0.0)
+                        st.write(f"{citation} · {kind} · scor={score:.3f}")
+
             if chat.get("external_sources"):
                 with st.expander("🌐 Surse Externe"):
                     for j, source in enumerate(chat["external_sources"], 1):
@@ -1067,7 +1441,14 @@ def main_chat_interface():
             if chat.get("response_time"):
                 response_time = chat["response_time"]
                 cached = "💾 (cache)" if chat.get("cached") else "🆕 (nou)"
-                st.caption(f"⏱️ {response_time:.2f}s {cached}")
+                route_used = chat.get("route_used", "vector")
+                st.caption(f"⏱️ {response_time:.2f}s {cached} · route={route_used}")
+                router_reason = chat.get("router_reason", "")
+                answer_origin_value = chat.get("answer_origin", "internal")
+                if router_reason:
+                    st.caption(f"origin={answer_origin_value} - reason={router_reason}")
+                else:
+                    st.caption(f"origin={answer_origin_value}")
 
     user_question = st.chat_input("Pune o întrebare despre sursele tale...")
     if user_question and user_question.strip():
@@ -1411,7 +1792,8 @@ def process_question(question: str):
                 question,
                 retrieval_mode=st.session_state.get("query_mode", "topic_general"),
                 active_collection=st.session_state.get("active_topic_collection", "") or None,
-                general_collection=GENERAL_COLLECTION_NAME
+                general_collection=GENERAL_COLLECTION_NAME,
+                include_memory=True,
             )
             
             end_time = time.time()
@@ -1421,12 +1803,18 @@ def process_question(question: str):
                 "question": question,
                 "response": result.get("response", "Nu am putut genera un răspuns."),
                 "sources": result.get("sources", []),
+                "graph_sources": result.get("graph_sources", []),
+                "memory_hits": result.get("memory_hits", []),
+                "tasks": result.get("tasks", []),
+                "provenance": result.get("provenance", []),
                 "external_sources": result.get("external_sources", []),
                 "response_time": result.get("response_time", end_time - start_time),
                 "cached": result.get("cached", False),
                 "model_used": result.get("model_used", "Unknown"),
                 "answer_origin": result.get("answer_origin", "internal"),
-                "retrieval_mode": result.get("retrieval_mode", st.session_state.get("query_mode", "topic_general"))
+                "retrieval_mode": result.get("retrieval_mode", st.session_state.get("query_mode", "topic_general")),
+                "route_used": result.get("route_used", "vector"),
+                "router_reason": result.get("router_reason", ""),
             }
             
             st.session_state.chat_history.append(chat_entry)
@@ -1551,12 +1939,9 @@ def main():
         # Inițializează starea sesiunii
         initialize_session_state()
         
-        # Auto-loading pentru experiență production-ready
-        # Încarcă automat toate documentele din bibliotecă
-        if (st.session_state.get('auto_load_enabled', True) and 
-            not st.session_state.get('auto_load_attempted', False) and
-            not st.session_state.get('documents_loaded', False)):
-            auto_load_library_documents()
+        # Startup rapid din DB (fără ingestie automată la refresh).
+        if not st.session_state.get("startup_bootstrap_done", False):
+            bootstrap_documents_from_storage(os.getenv('GOOGLE_API_KEY', ''))
         
         # Configurează bara laterală
         setup_sidebar()
