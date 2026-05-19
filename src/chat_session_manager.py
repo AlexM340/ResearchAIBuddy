@@ -1,5 +1,5 @@
 """
-Persistent chat session manager for APCI.
+Persistent chat session manager for CerebrumAI.
 Stores chat sessions in JSON files under data/chat_sessions.
 """
 

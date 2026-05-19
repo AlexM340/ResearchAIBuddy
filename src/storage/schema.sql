@@ -98,11 +98,34 @@ CREATE TABLE IF NOT EXISTS retrieval_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- User-authored notes: the "Second Brain" primitive for capturing your own thinking
+-- (not extracted from documents or chat — written directly by the user).
+CREATE TABLE IF NOT EXISTS notes (
+    id BIGSERIAL PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    topic_collection TEXT NOT NULL DEFAULT '',
+    tags TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS note_embeddings (
+    note_id BIGINT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+    embedding VECTOR(384) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_chunks_document_order ON chunks(document_id, chunk_order);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_decisions_topic_created ON decisions(topic_collection, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preferences_topic_updated ON preferences(topic_collection, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_topic_status_updated ON tasks(topic_collection, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_topic_updated ON notes(topic_collection, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_fts ON notes USING GIN (to_tsvector('simple', coalesce(title, '') || ' ' || content));
 CREATE INDEX IF NOT EXISTS idx_chunks_fts ON chunks USING GIN (to_tsvector('simple', text));
 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_hnsw
 ON chunk_embeddings USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_note_embeddings_hnsw
+ON note_embeddings USING hnsw (embedding vector_cosine_ops);

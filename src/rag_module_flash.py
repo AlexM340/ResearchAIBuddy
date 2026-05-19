@@ -1,5 +1,5 @@
 """
-Modulul RAG principal pentru APCI (Asistentul Personalizat de Cercetare și Învățare)
+Modulul RAG principal pentru CerebrumAI (Asistentul Personalizat de Cercetare și Învățare)
 Implementează sistemul RAG avansat cu Gemini 2.5 Flash
 """
 
@@ -46,6 +46,12 @@ try:
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
     print("Sentence Transformers nu este disponibil")
+
+try:
+    from sentence_transformers import CrossEncoder
+    CROSS_ENCODER_AVAILABLE = True
+except ImportError:
+    CROSS_ENCODER_AVAILABLE = False
 
 try:
     import numpy as np
@@ -123,7 +129,7 @@ class RAGConfig:
     chunk_size: int = 1000
     chunk_overlap: int = 200
     max_context_docs: int = 5
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     cache_enabled: bool = True
     rate_limit_rpm: int = 30
     rate_limit_rpd: int = 3000
@@ -142,6 +148,17 @@ class RAGConfig:
     graph_budget_ratio: float = 0.35
     enable_graph_rag: bool = True
     router_mode: str = "rule_based"
+    # Retrieval quality (P3): reranker + HyDE
+    enable_reranker: bool = True
+    reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    reranker_input_k: int = 20  # cat oversampling fata de top_k final
+    enable_hyde: bool = False  # genereaza pseudo-document pt expansion (extra LLM call)
+    hyde_max_tokens: int = 200
+    # Web search grounded (P4): Tavily
+    tavily_api_key: str = ""
+    enable_web_fallback: bool = True  # auto fallback cand context intern insuficient
+    web_fallback_max_results: int = 5
+    web_fallback_search_depth: str = "advanced"  # basic | advanced
     decision_extraction_enabled: bool = True
     graph_max_hops: int = 2
     graph_min_confidence: float = 0.70
@@ -266,23 +283,71 @@ class SimpleCache:
         self.stats = {"hits": 0, "misses": 0, "total_saved_tokens": 0}
 
 class PersistentEmbeddingsCache:
-    """Cache persistent pentru embeddings cu verificare hash MD5"""
-    
-    def __init__(self, cache_dir: str = "./data/embeddings_cache"):
+    """Cache persistent pentru embeddings cu verificare hash MD5 si tracking model."""
+
+    def __init__(self, cache_dir: str = "./data/embeddings_cache", model_name: str = ""):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Fișiere pentru cache
         self.metadata_file = self.cache_dir / "metadata.json"
         self.embeddings_file = self.cache_dir / "embeddings.pkl"
         self.documents_file = self.cache_dir / "documents.pkl"
-        
+        self.model_signature_file = self.cache_dir / "model_signature.json"
+
         # Încarcă cache-ul existent
         self.metadata = self._load_metadata()
         self.embeddings_cache = {}
         self.documents_cache = {}
-        
+
+        self.model_name = (model_name or "").strip()
+        self._enforce_model_signature()
+
         logger.info(f"Cache persistent inițializat în: {self.cache_dir}")
+
+    def _enforce_model_signature(self) -> None:
+        """Daca modelul s-a schimbat fata de cache, invalideaza cache-ul si marcheaza reindex pending."""
+        if not self.model_name:
+            return
+        sig = self._read_signature()
+        saved_model = sig.get("model_name", "")
+        pending = bool(sig.get("reindex_pending", False))
+        if saved_model and saved_model != self.model_name:
+            logger.warning(
+                "Embedding model change detected (was %s, now %s). Invalidating local cache.",
+                saved_model, self.model_name,
+            )
+            self.clear_cache()
+            pending = True
+        self._write_signature(self.model_name, pending)
+
+    def _read_signature(self) -> Dict[str, Any]:
+        if not self.model_signature_file.exists():
+            return {}
+        try:
+            with open(self.model_signature_file, 'r', encoding='utf-8') as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _write_signature(self, model_name: str, reindex_pending: bool) -> None:
+        try:
+            with open(self.model_signature_file, 'w', encoding='utf-8') as f:
+                json.dump({"model_name": model_name, "reindex_pending": bool(reindex_pending)}, f)
+        except Exception as exc:
+            logger.error(f"Nu am putut salva signature: {exc}")
+
+    def get_saved_model_name(self) -> str:
+        """Returneaza modelul cu care a fost build-uit cache-ul (sau '' daca lipseste)."""
+        return self._read_signature().get("model_name", "")
+
+    def is_reindex_pending(self) -> bool:
+        """True daca cache-ul a fost invalidat dar reindexarea DB nu a fost confirmata."""
+        return bool(self._read_signature().get("reindex_pending", False))
+
+    def mark_reindex_complete(self) -> None:
+        """Reseteaza flag-ul de reindex pending dupa o reindexare completa."""
+        self._write_signature(self.model_name, False)
     
     def _load_metadata(self) -> Dict[str, Any]:
         """Încarcă metadata din fișier"""
@@ -496,6 +561,71 @@ class PersistentEmbeddingsCache:
             'metadata_entries': len(self.metadata)
         }
 
+class MultilingualReranker:
+    """Cross-encoder reranker peste retrieved chunks (multilingv).
+
+    Foloseste un model HF de tip cross-encoder care primeste perechi (query, doc)
+    si returneaza un scor de relevanta. Modelul se incarca lazy la prima rerank().
+    """
+
+    def __init__(self, model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"):
+        self.model_name = model_name
+        self._model = None
+        self._unavailable = not CROSS_ENCODER_AVAILABLE
+
+    @property
+    def available(self) -> bool:
+        return not self._unavailable
+
+    def _ensure_loaded(self) -> bool:
+        if self._unavailable:
+            return False
+        if self._model is not None:
+            return True
+        try:
+            self._model = CrossEncoder(self.model_name)
+            logger.info("Reranker incarcat: %s", self.model_name)
+            return True
+        except Exception as exc:
+            logger.warning("Nu am putut incarca rerankerul %s: %s", self.model_name, exc)
+            self._unavailable = True
+            return False
+
+    def rerank(
+        self,
+        query: str,
+        documents: List[Dict[str, Any]],
+        top_k: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Sorteaza documente dupa relevanta (cross-encoder) si pastreaza primele top_k.
+
+        Pune scorul reranked in `doc["rerank_score"]` si normalizeaza retrieval_score.
+        Daca rerankerul nu e disponibil, returneaza documents[:top_k] netratate.
+        """
+        if not documents:
+            return []
+        if not self._ensure_loaded():
+            return documents[: int(top_k)]
+
+        try:
+            pairs = [(query, doc.get("content", "") or "") for doc in documents]
+            scores = self._model.predict(pairs)
+            scored = list(zip(documents, scores))
+            scored.sort(key=lambda item: float(item[1]), reverse=True)
+
+            out: List[Dict[str, Any]] = []
+            for doc, score in scored[: int(top_k)]:
+                doc["rerank_score"] = float(score)
+                # mapam la [0,1] pentru integrare in pipeline-ul de fusion existent
+                doc["retrieval_score"] = float(score)
+                doc["semantic_score"] = float(score)
+                out.append(doc)
+            return out
+        except Exception as exc:
+            logger.warning("Rerank esuat (%s); fallback la ordinea originala.", exc)
+            return documents[: int(top_k)]
+
+
 class OptimizedFlashLLM:
     """LLM optimizat pentru Gemini 2.5 Flash"""
     
@@ -639,7 +769,7 @@ class SimpleDocumentProcessor:
                 elif file_path.suffix.lower() == '.pdf' and LANGCHAIN_AVAILABLE:
                     loader = PyPDFLoader(str(file_path))
                     docs = loader.load()
-                    text_content = "\n".join([doc.page_content for doc in docs])
+                    text_content = "\n".join([doc.page_content for doc in docs]).replace("\x00", "")
                     
                 else:
                     logger.warning(f"Tip de fișier nesuportat: {file_path}")
@@ -731,8 +861,8 @@ class SimpleRetriever:
         self.document_embeddings = []
         self.chunk_lookup = {}
         
-        # Inițializare cache persistent
-        self.embeddings_cache = PersistentEmbeddingsCache()
+        # Inițializare cache persistent — primeste model_name pentru invalidare automata.
+        self.embeddings_cache = PersistentEmbeddingsCache(model_name=config.embedding_model)
         
         # Inițializare model embeddings dacă e disponibil
         if SENTENCE_TRANSFORMERS_AVAILABLE:
@@ -1085,8 +1215,8 @@ class SimpleRetriever:
 
         return expanded_scores
 
-class APCISystem:
-    """Sistemul principal APCI cu toate optimizările"""
+class CerebrumAISystem:
+    """Sistemul principal CerebrumAI cu toate optimizările"""
     
     def __init__(self, config: RAGConfig, api_key: str):
         self.config = config
@@ -1115,6 +1245,16 @@ class APCISystem:
         
         self.document_processor = SimpleDocumentProcessor(config)
         self.retriever = SimpleRetriever(config)
+
+        # Reranker multilingv (P3) — lazy load la prima utilizare.
+        self.reranker: Optional[MultilingualReranker] = None
+        if config.enable_reranker and CROSS_ENCODER_AVAILABLE:
+            try:
+                self.reranker = MultilingualReranker(model_name=config.reranker_model)
+                logger.info("Reranker pregatit (lazy load): %s", config.reranker_model)
+            except Exception as exc:
+                logger.warning("Init reranker esuat: %s", exc)
+                self.reranker = None
 
         # Second Brain storage (Postgres + pgvector), optional and fallback-safe.
         self.storage_client = None
@@ -1197,7 +1337,7 @@ class APCISystem:
             "documents_indexed": 0
         }
         
-        logger.info("APCISystem inițializat cu succes")
+        logger.info("CerebrumAISystem inițializat cu succes")
     
     def load_documents(
         self,
@@ -1417,7 +1557,7 @@ class APCISystem:
     def _create_rag_prompt(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
         """Creează prompt optimizat pentru RAG"""
         if not context_docs:
-            return f"""Ești APCI (Asistentul Personalizat de Cercetare și Învățare), un AI expert în educație și cercetare.
+            return f"""Ești CerebrumAI (Asistentul Personalizat de Cercetare și Învățare), un AI expert în educație și cercetare.
 
 Întrebare: {query}
 
@@ -1436,7 +1576,7 @@ Răspuns:"""
         
         context = "\n".join(context_parts)
         
-        return f"""Ești APCI (Asistentul Personalizat de Cercetare și Învățare). Analizează contextul și răspunde la întrebare.
+        return f"""Ești CerebrumAI (Asistentul Personalizat de Cercetare și Învățare). Analizează contextul și răspunde la întrebare.
 
 CONTEXT:
 {context}
@@ -1595,25 +1735,33 @@ RĂSPUNS:"""
         collection_filters: Optional[List[str]],
         k: int
     ) -> List[Dict[str, Any]]:
-        vector_k = max(int(k), int(self.config.vector_top_k))
+        final_k = max(int(k), int(self.config.vector_top_k))
+
+        # Daca rerankerul e activ, oversample din DB ca sa avem material pentru rerank.
+        rerank_active = bool(
+            self.reranker
+            and self.reranker.available
+            and self.config.enable_reranker
+        )
+        retrieval_k = max(final_k, int(self.config.reranker_input_k)) if rerank_active else final_k
+
+        # Optional HyDE: medie embeddings (query + pseudo-doc generat)
+        query_embedding = self._compute_query_embedding(question)
 
         # Prefer Postgres vector retrieval if configured.
         if (
             self.repository
             and self.repository.enabled
-            and self.retriever.embeddings_model is not None
+            and query_embedding is not None
         ):
             try:
-                query_embedding = self.retriever.embeddings_model.encode([question])[0]
-                if hasattr(query_embedding, "tolist"):
-                    query_embedding = query_embedding.tolist()
                 db_docs = self.repository.vector_search(
                     query_embedding=query_embedding,
                     collection_filters=collection_filters,
-                    top_k=vector_k,
+                    top_k=retrieval_k,
                 )
                 if db_docs:
-                    return db_docs
+                    return self._maybe_rerank(question, db_docs, final_k)
 
                 # In strict DB-primary mode, empty DB results are final; avoid stale local fallback.
                 if self.config.db_primary_strict:
@@ -1622,11 +1770,81 @@ RĂSPUNS:"""
                 logger.warning("DB vector retrieval failed; fallback to in-memory retriever: %s", exc)
 
         # Fallback to in-memory retriever.
-        return self.retriever.retrieve(
+        local_docs = self.retriever.retrieve(
             question,
-            k=vector_k,
+            k=retrieval_k,
             filter_fn=scope_filter,
         )
+        return self._maybe_rerank(question, local_docs, final_k)
+
+    def _maybe_rerank(
+        self,
+        question: str,
+        documents: List[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Aplica rerankerul daca e activ; altfel returneaza top_k din lista originala."""
+        if not documents:
+            return []
+        if not (self.reranker and self.reranker.available and self.config.enable_reranker):
+            return documents[: int(top_k)]
+        return self.reranker.rerank(question, documents, top_k=top_k)
+
+    def _compute_query_embedding(self, question: str) -> Optional[List[float]]:
+        """Calculeaza embedding-ul query-ului. Daca HyDE e activ, mediaza cu pseudo-doc."""
+        if self.retriever.embeddings_model is None:
+            return None
+        try:
+            base_emb = self.retriever.embeddings_model.encode([question])[0]
+            if hasattr(base_emb, "tolist"):
+                base_emb = base_emb.tolist()
+
+            if self.config.enable_hyde:
+                pseudo_doc = self._generate_hyde_pseudo_doc(question)
+                if pseudo_doc:
+                    pseudo_emb = self.retriever.embeddings_model.encode([pseudo_doc])[0]
+                    if hasattr(pseudo_emb, "tolist"):
+                        pseudo_emb = pseudo_emb.tolist()
+                    if NUMPY_AVAILABLE:
+                        avg = ((np.asarray(base_emb) + np.asarray(pseudo_emb)) / 2.0).tolist()
+                        return avg
+                    # fallback fara numpy
+                    return [(b + p) / 2.0 for b, p in zip(base_emb, pseudo_emb)]
+            return base_emb
+        except Exception as exc:
+            logger.warning("Query embedding esuat: %s", exc)
+            return None
+
+    def _generate_hyde_pseudo_doc(self, question: str) -> str:
+        """Genereaza un raspuns ipotetic scurt cu Gemini, util pentru retrieve (HyDE)."""
+        if not question or len(question.strip()) < 4:
+            return ""
+        prompt = (
+            "Imagine that you are answering the following question with a 1-2 sentence "
+            "factual passage in the same language as the question. Output only the passage, "
+            "without explanation or preface.\n\n"
+            f"Question: {question.strip()}\n\nPassage:"
+        )
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            raw = self.llm.generate(
+                prompt,
+                max_output_tokens=int(self.config.hyde_max_tokens),
+            )
+            self.stats["llm_calls"] += 1
+            return (raw or "").strip()
+        except TypeError:
+            # llm.generate fara max_output_tokens
+            try:
+                raw = self.llm.generate(prompt)
+                return (raw or "").strip()
+            except Exception as exc:
+                logger.warning("HyDE generation failed: %s", exc)
+                return ""
+        except Exception as exc:
+            logger.warning("HyDE generation failed: %s", exc)
+            return ""
 
     def _run_graph_retrieval(
         self,
@@ -1653,8 +1871,10 @@ RĂSPUNS:"""
         vector_docs: List[Dict[str, Any]],
         graph_paths: List[Dict[str, Any]],
         memory_hits: Optional[List[Dict[str, Any]]] = None,
+        note_hits: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         memory_hits = memory_hits or []
+        note_hits = note_hits or []
 
         memory_lines: List[str] = []
         memory_provenance: List[Dict[str, Any]] = []
@@ -1675,6 +1895,24 @@ RĂSPUNS:"""
                 }
             )
 
+        note_lines: List[str] = []
+        note_provenance: List[Dict[str, Any]] = []
+        for idx, note in enumerate(note_hits[:3], start=1):
+            note_title = note.get("title") or f"Nota {idx}"
+            note_content = note.get("content", "")
+            note_topic = note.get("topic_collection", "") or "global"
+            citation = f"N{idx}"
+            preview = note_content[:400] + "..." if len(note_content) > 400 else note_content
+            note_lines.append(f"[{citation}] {note_title} ({note_topic}) -> {preview}")
+            note_provenance.append(
+                {
+                    "citation": citation,
+                    "kind": "note",
+                    "score": float(note.get("similarity", 0.0) or 0.0),
+                    "source": note,
+                }
+            )
+
         if (
             self.context_builder is None
             or self.hybrid_fusion is None
@@ -1687,12 +1925,19 @@ RĂSPUNS:"""
                     + "\n".join(memory_lines)
                     + "\nFolosește citări [M#] când utilizezi memorie personală."
                 )
+            if note_lines:
+                prompt += (
+                    "\n\nNOTELE TALE PERSONALE:\n"
+                    + "\n".join(note_lines)
+                    + "\nFolosește citări [N#] când utilizezi notele tale."
+                )
             return {
                 "prompt": prompt,
-                "provenance": memory_provenance,
+                "provenance": memory_provenance + note_provenance,
                 "vector_sources": [doc.get("metadata", {}) for doc in vector_docs[: self.config.max_context_docs]],
                 "graph_sources": [],
                 "memory_sources": memory_hits[:3],
+                "note_sources": note_hits[:3],
                 "selected_vector_docs": vector_docs[: self.config.max_context_docs],
             }
 
@@ -1719,7 +1964,16 @@ RĂSPUNS:"""
                 + "\nFolosește citări [M#] când utilizezi memorie personală."
             )
             built["provenance"].extend(memory_provenance)
+        if note_lines:
+            built["prompt"] = (
+                built.get("prompt", "")
+                + "\n\nNOTELE TALE PERSONALE:\n"
+                + "\n".join(note_lines)
+                + "\nFolosește citări [N#] când utilizezi notele tale."
+            )
+            built["provenance"].extend(note_provenance)
         built["memory_sources"] = memory_hits[:3]
+        built["note_sources"] = note_hits[:3]
 
         selected_vector_docs = []
         for item in evidence_items:
@@ -1940,6 +2194,145 @@ RĂSPUNS:"""
                     topic_collection=preference.get("topic_collection", ""),
                     confidence=float(preference.get("confidence", 0.8)),
                 )
+
+    # Markeri care indica intent CLAR de capturare nota ("noteaza asta", "vreau sa retin").
+    _NOTE_EXPLICIT_MARKERS = (
+        "noteaza",
+        "salveaza ca nota",
+        "salveaza asta ca nota",
+        "creeaza o nota",
+        "creeaza nota",
+        "adauga ca nota",
+        "vreau sa retin asta",
+        "retin asta",
+        "save this as a note",
+        "save as note",
+        "create a note",
+        "let me note this",
+    )
+
+    # Markeri care semnaleaza insight/reflectie (mai slab — propunem confirmare).
+    _NOTE_INSIGHT_MARKERS = (
+        "am realizat ca",
+        "am realizat că",
+        "am observat ca",
+        "am observat că",
+        "imi dau seama ca",
+        "îmi dau seama că",
+        "concluzia mea este",
+        "concluzia mea e",
+        "din experienta",
+        "din experiența",
+        "important de retinut",
+        "important de reținut",
+        "merita retinut",
+        "merită reținut",
+        "ma gandesc ca",
+        "mă gândesc că",
+        "i realized that",
+        "i noticed that",
+        "key takeaway",
+        "worth noting",
+        "interesting that",
+    )
+
+    def _extract_note_candidates(
+        self,
+        question: str,
+        response: str,
+        active_collection: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Detectează pasaje 'note-worthy' din schimbul de chat.
+
+        Returneaza candidati cu `confidence` care decide tier-ul in query():
+          - >= 0.85 → auto-save silent + badge in chat
+          - 0.50-0.85 → confirm card in chat ("Vrei sa salvez asta ca nota?")
+          - < 0.50 → drop
+        Detectie pe markeri (cheap, fara LLM call suplimentar):
+          - Markeri EXPLICITI ("noteaza", "salveaza ca nota") → conf 0.9, content = ce vine dupa marker
+          - Markeri de INSIGHT ("am realizat ca", "observ ca") → conf 0.7, content = intreaga intrebare
+        """
+        text = (question or "").strip()
+        if not text:
+            return []
+        text_lower = text.lower()
+
+        # 1. Marker explicit: utilizatorul cere clar capturarea
+        explicit_patterns = [
+            r"(?:noteaza|salveaza\s+(?:asta\s+)?ca\s+nota|adauga\s+ca\s+nota|creeaza\s+(?:o\s+)?nota)\s*[:\-]?\s*(.+)$",
+            r"(?:vreau\s+sa\s+retin|retin)\s*[:\-]?\s*(.+)$",
+            r"(?:save\s+(?:this\s+)?as\s+(?:a\s+)?note|create\s+a\s+note|let\s+me\s+note\s+this)\s*[:\-]?\s*(.+)$",
+        ]
+        for pattern in explicit_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                content = match.group(1).strip(" .,:;\"'") if match.lastindex else ""
+                if not content or len(content) < 5:
+                    # marker singur, fara payload — folosim raspunsul ca content
+                    content = (response or "").strip()
+                    if len(content) > 500:
+                        content = content[:500] + "..."
+                if content:
+                    title = content[:60].rstrip(" .,:;") + ("..." if len(content) > 60 else "")
+                    return [{
+                        "title": title,
+                        "content": content,
+                        "topic_collection": active_collection or "",
+                        "confidence": 0.90,
+                        "source": "extracted_explicit",
+                    }]
+
+        # 2. Marker de insight: utilizatorul exprima o reflectie → propunere
+        for marker in self._NOTE_INSIGHT_MARKERS:
+            if marker in text_lower:
+                content = text.strip(" .,:;\"'")
+                if len(content) > 500:
+                    content = content[:500] + "..."
+                title = content[:60].rstrip(" .,:;") + ("..." if len(content) > 60 else "")
+                return [{
+                    "title": title,
+                    "content": content,
+                    "topic_collection": active_collection or "",
+                    "confidence": 0.65,
+                    "source": "extracted_insight",
+                }]
+
+        return []
+
+    def _process_note_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Aplica tier-uri pe candidatii de note.
+
+        Returneaza {auto_saved: [...], proposed: [...]} pentru a fi propagate
+        in result-ul query() si afisate in chat.
+        """
+        result = {"auto_saved": [], "proposed": []}
+        for cand in candidates or []:
+            conf = float(cand.get("confidence", 0.0) or 0.0)
+            if conf >= 0.85:
+                note_id = self.create_note(
+                    content=cand.get("content", ""),
+                    title=cand.get("title", ""),
+                    topic_collection=cand.get("topic_collection", "") or "",
+                )
+                if note_id:
+                    result["auto_saved"].append({
+                        "id": note_id,
+                        "title": cand.get("title", ""),
+                        "content_preview": (cand.get("content", "") or "")[:120],
+                        "topic_collection": cand.get("topic_collection", "") or "",
+                        "confidence": conf,
+                    })
+            elif conf >= 0.50:
+                result["proposed"].append({
+                    "title": cand.get("title", ""),
+                    "content": cand.get("content", ""),
+                    "topic_collection": cand.get("topic_collection", "") or "",
+                    "confidence": conf,
+                })
+        return result
 
     def _extract_task_candidates(
         self,
@@ -2217,24 +2610,39 @@ RĂSPUNS:"""
         response_text = (response or "").strip().upper()
         return response_text.startswith("INSUFFICIENT_CONTEXT")
 
-    def _fetch_external_sources(self, question: str, max_results: int = 5) -> List[Dict[str, Any]]:
-        tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    @property
+    def web_search_available(self) -> bool:
+        """True daca Tavily key e configurat (din config sau env)."""
+        key = (self.config.tavily_api_key or "").strip() or os.getenv("TAVILY_API_KEY", "").strip()
+        return bool(key)
+
+    def _fetch_external_sources(
+        self,
+        question: str,
+        max_results: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch web sources via Tavily. Foloseste config (tavily_api_key, search_depth)."""
+        tavily_api_key = (self.config.tavily_api_key or "").strip() or os.getenv("TAVILY_API_KEY", "").strip()
         if not tavily_api_key:
             return []
+
+        depth = (self.config.web_fallback_search_depth or "advanced").strip().lower()
+        if depth not in {"basic", "advanced"}:
+            depth = "advanced"
 
         payload = {
             "api_key": tavily_api_key,
             "query": question,
-            "max_results": max_results,
-            "search_depth": "advanced",
-            "include_answer": False
+            "max_results": int(max_results or self.config.web_fallback_max_results or 5),
+            "search_depth": depth,
+            "include_answer": False,
         }
 
         try:
             response = requests.post(
                 "https://api.tavily.com/search",
                 json=payload,
-                timeout=20
+                timeout=20,
             )
             response.raise_for_status()
             data = response.json()
@@ -2243,7 +2651,7 @@ RĂSPUNS:"""
                 sources.append({
                     "title": item.get("title", "Sursă externă"),
                     "url": item.get("url", ""),
-                    "snippet": item.get("content", "")
+                    "snippet": item.get("content", ""),
                 })
             return sources
         except Exception as e:
@@ -2252,7 +2660,7 @@ RĂSPUNS:"""
 
     def _create_external_prompt(self, question: str, external_sources: List[Dict[str, Any]]) -> str:
         if not external_sources:
-            return f"""Ești APCI. Nu există surse interne suficiente pentru această întrebare.
+            return f"""Ești CerebrumAI. Nu există surse interne suficiente pentru această întrebare.
 
 ÎNTREBARE: {question}
 
@@ -2273,7 +2681,7 @@ INSTRUCȚIUNI:
             )
 
         sources_text = "\n\n".join(source_blocks)
-        return f"""Ești APCI. Sursele interne sunt insuficiente, folosește doar sursele externe de mai jos.
+        return f"""Ești CerebrumAI. Sursele interne sunt insuficiente, folosește doar sursele externe de mai jos.
 
 SURSE EXTERNE:
 {sources_text}
@@ -2297,7 +2705,34 @@ INSTRUCȚIUNI:
         route_used: str = "vector",
         router_reason: str = "",
         memory_hits: Optional[List[Dict[str, Any]]] = None,
+        force: bool = False,
     ) -> Dict[str, Any]:
+        # Daca web fallback dezactivat si nu suntem fortati explicit, returneaza un raspuns minimal.
+        if not force and not self.config.enable_web_fallback:
+            response_time = time.time() - start_time
+            return {
+                "response": (
+                    "Nu am suficient context intern pentru aceasta intrebare si "
+                    "fallback-ul pe web este dezactivat. Activeaza 'Cauta pe web' "
+                    "in sidebar sau apasa butonul 'Cauta pe web' din chat."
+                ),
+                "sources": [],
+                "graph_sources": [],
+                "memory_hits": memory_hits or [],
+                "tasks": [],
+                "provenance": [],
+                "external_sources": [],
+                "cached": False,
+                "response_time": response_time,
+                "model_used": self.llm.model_name,
+                "answer_origin": "external_disabled",
+                "fallback_reason": reason,
+                "retrieval_mode": retrieval_mode,
+                "active_collection": active_collection,
+                "route_used": route_used,
+                "router_reason": router_reason or f"fallback_disabled:{reason}",
+            }
+
         external_sources = self._fetch_external_sources(question)
         external_prompt = self._create_external_prompt(question, external_sources)
 
@@ -2372,11 +2807,35 @@ INSTRUCȚIUNI:
         general_collection: str = "general",
         time_window_days: Optional[int] = None,
         include_memory: bool = True,
+        force_web: bool = False,
     ) -> Dict[str, Any]:
-        """Procesează o întrebare și returnează răspunsul"""
+        """Procesează o întrebare și returnează răspunsul.
+
+        force_web=True bypaseaza retrievalul intern si interogheaza direct Tavily.
+        """
         start_time = time.time()
         self.stats["total_queries"] += 1
-        
+
+        # Web search forcat: skip retrievalul intern complet.
+        if force_web:
+            memory_hits = self._retrieve_memory_hits(
+                question=question,
+                active_collection=active_collection,
+                limit=3,
+                time_window_days=time_window_days,
+            ) if include_memory else []
+            return self._run_external_fallback(
+                question,
+                start_time,
+                retrieval_mode,
+                active_collection,
+                reason="user_forced_web_search",
+                route_used="external",
+                router_reason="user_forced",
+                memory_hits=memory_hits,
+                force=True,
+            )
+
         try:
             scope_mode = retrieval_mode if retrieval_mode in {"topic", "topic_general", "all"} else "topic_general"
             scope_filter = self._build_scope_filter(
@@ -2436,7 +2895,17 @@ INSTRUCȚIUNI:
                 time_window_days=time_window_days,
             ) if include_memory else []
 
-            if not vector_docs and not graph_paths:
+            # Vector search peste notele utilizatorului (primitiva Second Brain).
+            # Scope: daca esti intr-un notebook in mod "topic" strict, doar notele acelui topic.
+            # Altfel (topic_general / all / Second Brain), toate notele.
+            notes_topic_scope = active_collection if scope_mode == "topic" else None
+            note_hits = self.search_notes(
+                query=question,
+                topic_collection=notes_topic_scope,
+                top_k=3,
+            ) if include_memory else []
+
+            if not vector_docs and not graph_paths and not note_hits:
                 return self._run_external_fallback(
                     question,
                     start_time,
@@ -2454,11 +2923,13 @@ INSTRUCȚIUNI:
                 vector_docs=vector_docs,
                 graph_paths=graph_paths,
                 memory_hits=memory_hits,
+                note_hits=note_hits,
             )
             prompt = context_payload.get("prompt", "")
             selected_vector_docs = context_payload.get("selected_vector_docs", vector_docs)
             provenance = context_payload.get("provenance", [])
             graph_sources = context_payload.get("graph_sources", [])
+            note_sources = context_payload.get("note_sources", [])
 
             if not prompt:
                 return self._run_external_fallback(
@@ -2520,6 +2991,13 @@ INSTRUCȚIUNI:
                     if task_candidates:
                         self._persist_tasks(task_candidates)
 
+                    note_candidates = self._extract_note_candidates(
+                        question=question,
+                        response=cached_response,
+                        active_collection=active_collection,
+                    )
+                    note_outcome = self._process_note_candidates(note_candidates)
+
                     self._capture_episode(
                         question=question,
                         response=cached_response,
@@ -2532,6 +3010,7 @@ INSTRUCȚIUNI:
                         "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
                         "graph_sources": graph_sources,
                         "memory_hits": memory_hits,
+                        "note_sources": note_sources,
                         "tasks": self.list_tasks(active_collection=active_collection, limit=20),
                         "provenance": provenance,
                         "external_sources": [],
@@ -2543,6 +3022,15 @@ INSTRUCȚIUNI:
                         "active_collection": active_collection,
                         "route_used": route_used,
                         "router_reason": router_reason,
+                        "auto_captured": {
+                            "tasks": list(task_candidates or []),
+                            "preferences": list(preference_candidates or []),
+                            "decisions": [],
+                            "notes": note_outcome["auto_saved"],
+                        },
+                        "proposed_artifacts": {
+                            "notes": note_outcome["proposed"],
+                        },
                     }
             
             # Rate limiting
@@ -2603,6 +3091,13 @@ INSTRUCȚIUNI:
             if task_candidates:
                 self._persist_tasks(task_candidates)
 
+            note_candidates = self._extract_note_candidates(
+                question=question,
+                response=response,
+                active_collection=active_collection,
+            )
+            note_outcome = self._process_note_candidates(note_candidates)
+
             self._run_memory_consolidation(active_collection=active_collection)
             tasks_snapshot = self.list_tasks(active_collection=active_collection, limit=20)
 
@@ -2624,6 +3119,7 @@ INSTRUCȚIUNI:
                 "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
                 "graph_sources": graph_sources,
                 "memory_hits": memory_hits,
+                "note_sources": note_sources,
                 "tasks": tasks_snapshot,
                 "provenance": provenance,
                 "external_sources": [],
@@ -2636,6 +3132,15 @@ INSTRUCȚIUNI:
                 "active_collection": active_collection,
                 "route_used": route_used,
                 "router_reason": router_reason,
+                "auto_captured": {
+                    "tasks": list(task_candidates or []),
+                    "preferences": list(preference_candidates or []),
+                    "decisions": [decision_candidate] if decision_candidate else [],
+                    "notes": note_outcome["auto_saved"],
+                },
+                "proposed_artifacts": {
+                    "notes": note_outcome["proposed"],
+                },
             }
             
         except Exception as e:
@@ -2754,6 +3259,909 @@ INSTRUCȚIUNI:
             status["db"].update(db_stats)
         return status
     
+    def get_graph_stats(self) -> Dict[str, Any]:
+        """Returns concept/relation counts from Neo4j for dashboard metrics."""
+        if self.neo4j_client and self.neo4j_client.enabled:
+            return self.neo4j_client.get_graph_stats()
+        return {}
+
+    def get_graph_viz_data(
+        self,
+        limit_nodes: int = 150,
+        relation_types=None,
+        collection_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Returns nodes + edges for interactive graph visualization."""
+        if self.neo4j_client and self.neo4j_client.enabled:
+            return self.neo4j_client.get_graph_viz_data(
+                limit_nodes=limit_nodes,
+                relation_types=relation_types,
+                collection_filter=collection_filter,
+            )
+        return {"nodes": [], "edges": []}
+
+    def get_contradictions(self, limit: int = 20, include_dismissed: bool = False) -> List[Dict[str, Any]]:
+        """Returns contradiction pairs from graph for E4 contradiction panel."""
+        if self.neo4j_client and self.neo4j_client.enabled:
+            return self.neo4j_client.get_contradictions(limit=limit, include_dismissed=include_dismissed)
+        return []
+
+    def list_recent_decisions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Returns most recent decisions for memory surfacing."""
+        if self.repository and self.repository.enabled:
+            return self.repository.list_recent_decisions(limit=limit)
+        return []
+
+    def list_aged_decisions(
+        self,
+        min_age_days: int = 30,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Returns decisions older than threshold (drift candidates)."""
+        if self.repository and self.repository.enabled:
+            return self.repository.list_aged_decisions(min_age_days=min_age_days, limit=limit)
+        return []
+
+    def list_all_decisions(self, topic_collection: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        if self.repository and self.repository.enabled:
+            return self.repository.list_all_decisions(topic_collection=topic_collection, limit=limit) or []
+        return []
+
+    def update_decision(
+        self,
+        decision_id: int,
+        title: Optional[str] = None,
+        rationale: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.update_decision(
+                decision_id=decision_id,
+                title=title,
+                rationale=rationale,
+                topic_collection=topic_collection,
+                confidence=confidence,
+            )
+        return False
+
+    def delete_decision(self, decision_id: int) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.delete_decision(decision_id=decision_id)
+        return False
+
+    def list_all_preferences(self, topic_collection: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        if self.repository and self.repository.enabled:
+            return self.repository.list_all_preferences(topic_collection=topic_collection, limit=limit) or []
+        return []
+
+    def update_preference(
+        self,
+        preference_id: int,
+        preference_value: Optional[str] = None,
+        confidence: Optional[float] = None,
+        topic_collection: Optional[str] = None,
+    ) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.update_preference(
+                preference_id=preference_id,
+                preference_value=preference_value,
+                confidence=confidence,
+                topic_collection=topic_collection,
+            )
+        return False
+
+    def delete_preference(self, preference_id: int) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.delete_preference(preference_id=preference_id)
+        return False
+
+    def list_retrieval_logs(self, limit: int = 100, route_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        if self.repository and self.repository.enabled:
+            return self.repository.list_retrieval_logs(limit=limit, route_filter=route_filter) or []
+        return []
+
+    def get_retrieval_stats(self, days: int = 7) -> Dict[str, Any]:
+        if self.repository and self.repository.enabled:
+            return self.repository.get_retrieval_stats(days=days) or {}
+        return {}
+
+    def get_weekly_summary(self, days: int = 7) -> Dict[str, Any]:
+        if self.repository and self.repository.enabled:
+            return self.repository.get_weekly_summary(days=days) or {}
+        return {}
+
+    def dismiss_contradiction(self, source: str, target: str, note: str = "") -> bool:
+        if self.neo4j_client and self.neo4j_client.enabled:
+            return self.neo4j_client.dismiss_contradiction(source=source, target=target, note=note)
+        return False
+
+    def restore_contradiction(self, source: str, target: str) -> bool:
+        if self.neo4j_client and self.neo4j_client.enabled:
+            return self.neo4j_client.restore_contradiction(source=source, target=target)
+        return False
+
+    def list_top_preferences(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Returns top-confidence preferences for memory surfacing."""
+        if self.repository and self.repository.enabled:
+            return self.repository.list_top_preferences(limit=limit)
+        return []
+
+    # ------------------------------------------------------------------
+    # Notes — user-authored Second Brain primitive
+    # ------------------------------------------------------------------
+
+    def _embed_note_text(self, title: str, content: str) -> Optional[List[float]]:
+        """Compute embedding for a note (title + content)."""
+        embeddings_model = getattr(self.retriever, "embeddings_model", None)
+        if embeddings_model is None:
+            return None
+        try:
+            text = f"{title}\n\n{content}".strip() if title else content.strip()
+            if not text:
+                return None
+            vec = embeddings_model.encode([text])[0]
+            if hasattr(vec, "tolist"):
+                vec = vec.tolist()
+            return list(vec)
+        except Exception as exc:
+            logger.warning("_embed_note_text failed: %s", exc)
+            return None
+
+    def create_note(
+        self,
+        content: str,
+        title: str = "",
+        topic_collection: str = "",
+        tags: Optional[List[str]] = None,
+    ) -> Optional[int]:
+        """Create a user-authored note + compute its embedding for retrieval."""
+        if not self.repository or not self.repository.enabled:
+            return None
+        embedding = self._embed_note_text(title, content)
+        return self.repository.create_note(
+            content=content,
+            title=title,
+            topic_collection=topic_collection,
+            tags=tags,
+            embedding=embedding,
+        )
+
+    def update_note(
+        self,
+        note_id: int,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> bool:
+        """Update a note. If title or content changes, recompute the embedding."""
+        if not self.repository or not self.repository.enabled:
+            return False
+        embedding: Optional[List[float]] = None
+        if title is not None or content is not None:
+            current = self.repository.get_note(note_id) or {}
+            final_title = title if title is not None else current.get("title", "")
+            final_content = content if content is not None else current.get("content", "")
+            embedding = self._embed_note_text(final_title, final_content)
+        return self.repository.update_note(
+            note_id=note_id,
+            title=title,
+            content=content,
+            topic_collection=topic_collection,
+            tags=tags,
+            embedding=embedding,
+        )
+
+    def delete_note(self, note_id: int) -> bool:
+        if not self.repository or not self.repository.enabled:
+            return False
+        return self.repository.delete_note(note_id)
+
+    def get_note(self, note_id: int) -> Optional[Dict[str, Any]]:
+        if not self.repository or not self.repository.enabled:
+            return None
+        return self.repository.get_note(note_id)
+
+    def list_notes(
+        self,
+        topic_collection: Optional[str] = None,
+        text_query: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        if not self.repository or not self.repository.enabled:
+            return []
+        return self.repository.list_notes(
+            topic_collection=topic_collection,
+            text_query=text_query,
+            limit=limit,
+        )
+
+    def search_notes(
+        self,
+        query: str,
+        topic_collection: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Vector search over notes for retrieval / surfacing."""
+        if not self.repository or not self.repository.enabled:
+            return []
+        embedding = self._embed_note_text("", query)
+        if embedding is None:
+            return []
+        return self.repository.vector_search_notes(
+            query_embedding=embedding,
+            topic_collection=topic_collection,
+            top_k=top_k,
+        )
+
+    # ------------------------------------------------------------------
+    # Synthesis on demand — agregare structurata a cunostintelor pe topic
+    # ------------------------------------------------------------------
+
+    def synthesize_topic(
+        self,
+        topic_collection: str,
+        max_doc_chunks: int = 6,
+        max_notes: int = 8,
+        max_decisions: int = 5,
+        max_preferences: int = 5,
+    ) -> Dict[str, Any]:
+        """Genereaza un outline markdown care sumarizeaza tot ce stii despre topic.
+
+        Agregheaza:
+          - chunks reprezentative din documentele topicului (vector search)
+          - notele tale tagged cu topicul
+          - decizii memorate in topic
+          - preferinte exprimate in topic
+        Apoi cere Gemini sa produca outline structurat cu citatii [D#] [N#] [Dec#] [P#].
+        """
+        result: Dict[str, Any] = {
+            "topic": topic_collection,
+            "outline": "",
+            "sources_used": {"docs": [], "notes": [], "decisions": [], "preferences": []},
+            "model_used": "",
+            "error": None,
+        }
+
+        topic = (topic_collection or "").strip()
+        if not topic:
+            result["error"] = "Topic obligatoriu pentru sinteza."
+            return result
+
+        # 1. Documente: vector search cu query derivat din topic name.
+        doc_chunks: List[Dict[str, Any]] = []
+        if self.repository and self.repository.enabled:
+            try:
+                doc_query = f"concepte principale, idei centrale, concluzii, sumar despre {topic}"
+                doc_embedding = self._embed_note_text("", doc_query)
+                if doc_embedding:
+                    doc_chunks = self.repository.vector_search(
+                        query_embedding=doc_embedding,
+                        collection_filters=[topic],
+                        top_k=max_doc_chunks,
+                    ) or []
+            except Exception as exc:
+                logger.warning("synthesize_topic doc retrieval failed: %s", exc)
+
+        # 2. Note proprii.
+        notes = self.list_notes(topic_collection=topic, limit=max_notes) or []
+
+        # 3. Decizii in topic.
+        decisions: List[Dict[str, Any]] = []
+        if self.repository and self.repository.enabled:
+            try:
+                all_decisions = self.repository.list_all_decisions(limit=200) or []
+                decisions = [
+                    d for d in all_decisions
+                    if (d.get("topic_collection") or "").strip() == topic
+                ][:max_decisions]
+            except Exception:
+                pass
+
+        # 4. Preferinte in topic.
+        preferences: List[Dict[str, Any]] = []
+        if self.repository and self.repository.enabled:
+            try:
+                all_prefs = self.repository.list_all_preferences(limit=200) or []
+                preferences = [
+                    p for p in all_prefs
+                    if (p.get("topic_collection") or "").strip() == topic
+                ][:max_preferences]
+            except Exception:
+                pass
+
+        if not (doc_chunks or notes or decisions or preferences):
+            result["error"] = (
+                f"Nu ai inca nimic capturat in topicul '{topic}'. "
+                "Adauga documente, note sau pune intrebari mai intai."
+            )
+            return result
+
+        prompt = self._build_synthesis_prompt(topic, doc_chunks, notes, decisions, preferences)
+
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            outline = self.llm.generate(prompt)
+            result["outline"] = (outline or "").strip()
+            result["model_used"] = self.llm.model_name
+            result["sources_used"]["docs"] = [
+                {
+                    "filename": c.get("metadata", {}).get("filename", "?"),
+                    "snippet": (c.get("content", "") or "")[:200],
+                }
+                for c in doc_chunks
+            ]
+            result["sources_used"]["notes"] = [
+                {
+                    "id": n.get("id"),
+                    "title": n.get("title", "") or f"Nota #{n.get('id', '?')}",
+                    "preview": (n.get("content", "") or "")[:200],
+                }
+                for n in notes
+            ]
+            result["sources_used"]["decisions"] = [
+                {"id": d.get("id"), "title": d.get("title", "")}
+                for d in decisions
+            ]
+            result["sources_used"]["preferences"] = [
+                {
+                    "id": p.get("id"),
+                    "key": p.get("preference_key", ""),
+                    "value": p.get("preference_value", ""),
+                }
+                for p in preferences
+            ]
+        except Exception as exc:
+            logger.error("synthesize_topic generation failed: %s", exc)
+            result["error"] = f"Generarea sintezei a esuat: {exc}"
+
+        return result
+
+    def _build_synthesis_prompt(
+        self,
+        topic: str,
+        doc_chunks: List[Dict[str, Any]],
+        notes: List[Dict[str, Any]],
+        decisions: List[Dict[str, Any]],
+        preferences: List[Dict[str, Any]],
+    ) -> str:
+        """Construieste promptul pentru sinteza topicului."""
+        parts: List[str] = [
+            f"Esti CerebrumAI. Sintetizeaza intr-un outline markdown structurat tot ce "
+            f"stie utilizatorul despre topicul '{topic}'.",
+            "",
+            "MATERIAL DISPONIBIL:",
+            "",
+        ]
+
+        if doc_chunks:
+            parts.append("### DOCUMENTE (snippet-uri reprezentative)")
+            for i, chunk in enumerate(doc_chunks, 1):
+                meta = chunk.get("metadata", {}) or {}
+                fname = meta.get("filename", f"doc{i}")
+                content = (chunk.get("content", "") or "")[:500]
+                parts.append(f"[D{i}] {fname}: {content}")
+            parts.append("")
+
+        if notes:
+            parts.append("### NOTELE TALE PERSONALE (gandirea ta proprie)")
+            for i, note in enumerate(notes, 1):
+                title = note.get("title") or f"Nota {i}"
+                content = (note.get("content", "") or "")[:500]
+                parts.append(f"[N{i}] {title}: {content}")
+            parts.append("")
+
+        if decisions:
+            parts.append("### DECIZII LUATE")
+            for i, d in enumerate(decisions, 1):
+                title = d.get("title", f"Decizie {i}")
+                rationale = (d.get("rationale", "") or "")[:300]
+                parts.append(f"[Dec{i}] {title}: {rationale}")
+            parts.append("")
+
+        if preferences:
+            parts.append("### PREFERINTE EXPRIMATE")
+            for i, p in enumerate(preferences, 1):
+                key = p.get("preference_key", "")
+                value = p.get("preference_value", "")
+                parts.append(f"[P{i}] {key}: {value}")
+            parts.append("")
+
+        parts.extend([
+            "INSTRUCTIUNI DE OUTPUT:",
+            "- Genereaza markdown bine structurat, cu headings (##) si bullets.",
+            "- Incepe cu o sectiune '## Privire de ansamblu' (2-3 propozitii).",
+            "- Organizeaza pe sub-teme logice (descopera-le din continut, nu le forta).",
+            "- Citeaza sursele: [D#] pentru documente, [N#] pentru note, [Dec#] pentru decizii, [P#] pentru preferinte.",
+            "- Marcheaza explicit gap-urile observate: 'Nu ai notat inca nimic despre X' sau 'Documentele acopera Y, dar nu ai o opinie proprie notata'.",
+            "- Daca exista CONTRADICTII intre note, decizii si documente, semnaleaza-le intr-o sectiune '## Tensiuni si contradictii'.",
+            "- La final, sectiune '## Next steps' cu 3-5 actiuni concrete bazate pe gap-uri + decizii recente.",
+            "- Limba: romana.",
+            "- Lungime: 400-900 cuvinte.",
+            "- Output: DOAR markdown-ul outline-ului, fara preambul.",
+        ])
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Timeline — agregare cronologica a evenimentelor de cunostinte
+    # ------------------------------------------------------------------
+
+    def get_timeline_events(
+        self,
+        topic_collection: Optional[str] = None,
+        days: int = 14,
+        event_types: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Agregare cronologica a evenimentelor din cele 5 tabele de cunostinte.
+
+        Tipuri emise:
+          - note_created, note_updated
+          - decision
+          - task_created, task_done
+          - document_added
+          - chat_started
+
+        event_types=None inseamna toate. topic_collection=None inseamna global.
+        """
+        if not self.repository or not self.repository.enabled:
+            return []
+
+        since = datetime.now(timezone.utc) - timedelta(days=int(days))
+        since_iso = since.isoformat()
+        allow = set(event_types) if event_types else None
+
+        def _wanted(t: str) -> bool:
+            return allow is None or t in allow
+
+        def _topic_match(topic_value: Optional[str]) -> bool:
+            if not topic_collection:
+                return True
+            return (topic_value or "").strip() == topic_collection.strip()
+
+        events: List[Dict[str, Any]] = []
+
+        # 1. Note (created + updated daca diferite)
+        if _wanted("note_created") or _wanted("note_updated"):
+            try:
+                notes = self.repository.list_notes(
+                    topic_collection=topic_collection,
+                    limit=500,
+                ) or []
+                for note in notes:
+                    nid = note.get("id")
+                    title = note.get("title") or f"Nota #{nid}"
+                    preview = (note.get("content", "") or "")[:200]
+                    topic_val = note.get("topic_collection", "") or "global"
+                    created = note.get("created_at", "")
+                    updated = note.get("updated_at", "")
+                    if _wanted("note_created") and created and created >= since_iso:
+                        events.append({
+                            "type": "note_created",
+                            "icon": "💡",
+                            "timestamp": created,
+                            "topic_collection": topic_val,
+                            "title": title,
+                            "preview": preview,
+                            "metadata": {"id": nid, "tags": note.get("tags", [])},
+                        })
+                    if (
+                        _wanted("note_updated")
+                        and updated
+                        and updated >= since_iso
+                        and updated != created
+                    ):
+                        events.append({
+                            "type": "note_updated",
+                            "icon": "✏️",
+                            "timestamp": updated,
+                            "topic_collection": topic_val,
+                            "title": title,
+                            "preview": preview,
+                            "metadata": {"id": nid},
+                        })
+            except Exception as exc:
+                logger.warning("timeline notes failed: %s", exc)
+
+        # 2. Decizii
+        if _wanted("decision"):
+            try:
+                decisions = self.repository.list_all_decisions(limit=500) or []
+                for d in decisions:
+                    if not _topic_match(d.get("topic_collection")):
+                        continue
+                    created = d.get("created_at", "")
+                    if not created or created < since_iso:
+                        continue
+                    events.append({
+                        "type": "decision",
+                        "icon": "⚙️",
+                        "timestamp": created,
+                        "topic_collection": d.get("topic_collection", "") or "global",
+                        "title": d.get("title", "Decizie"),
+                        "preview": (d.get("rationale", "") or "")[:250],
+                        "metadata": {
+                            "id": d.get("id"),
+                            "confidence": d.get("confidence", 0.0),
+                        },
+                    })
+            except Exception as exc:
+                logger.warning("timeline decisions failed: %s", exc)
+
+        # 3. Task-uri (created + done)
+        if _wanted("task_created") or _wanted("task_done"):
+            try:
+                tasks = self.repository.list_tasks(
+                    topic_collection=topic_collection,
+                    limit=500,
+                ) or []
+                for t in tasks:
+                    tid = t.get("id")
+                    title = t.get("title", f"Task #{tid}")
+                    topic_val = t.get("topic_collection", "") or "global"
+                    status = t.get("status", "open")
+                    priority = t.get("priority", "normal")
+                    created = t.get("created_at", "")
+                    updated = t.get("updated_at", "")
+                    if _wanted("task_created") and created and created >= since_iso:
+                        events.append({
+                            "type": "task_created",
+                            "icon": "📌",
+                            "timestamp": created,
+                            "topic_collection": topic_val,
+                            "title": title,
+                            "preview": (t.get("details", "") or "")[:200],
+                            "metadata": {"id": tid, "priority": priority, "status": status},
+                        })
+                    if (
+                        _wanted("task_done")
+                        and status == "done"
+                        and updated
+                        and updated >= since_iso
+                        and updated != created
+                    ):
+                        events.append({
+                            "type": "task_done",
+                            "icon": "✅",
+                            "timestamp": updated,
+                            "topic_collection": topic_val,
+                            "title": title,
+                            "preview": "",
+                            "metadata": {"id": tid, "priority": priority},
+                        })
+            except Exception as exc:
+                logger.warning("timeline tasks failed: %s", exc)
+
+        # 4. Documente
+        if _wanted("document_added"):
+            try:
+                docs = self.repository.list_recent_documents(
+                    topic_collection=topic_collection,
+                    days=int(days),
+                    limit=200,
+                ) or []
+                for doc in docs:
+                    events.append({
+                        "type": "document_added",
+                        "icon": "📄",
+                        "timestamp": doc.get("created_at", ""),
+                        "topic_collection": doc.get("collection_name", "") or "global",
+                        "title": doc.get("original_name", "Document"),
+                        "preview": doc.get("source_path", ""),
+                        "metadata": {
+                            "id": doc.get("id"),
+                            "indexed": doc.get("indexed", False),
+                        },
+                    })
+            except Exception as exc:
+                logger.warning("timeline documents failed: %s", exc)
+
+        # 5. Chat sessions
+        if _wanted("chat_started"):
+            try:
+                sessions = self.repository.list_sessions(
+                    topic_collection=topic_collection,
+                ) or []
+                for s in sessions:
+                    created = s.get("created_at", "")
+                    if not created:
+                        continue
+                    # robust pe iso strings: filter after parse
+                    if isinstance(created, str) and created < since_iso:
+                        continue
+                    events.append({
+                        "type": "chat_started",
+                        "icon": "💬",
+                        "timestamp": created,
+                        "topic_collection": s.get("topic_collection", "") or "global",
+                        "title": s.get("title", "Chat nou"),
+                        "preview": "",
+                        "metadata": {
+                            "id": s.get("id"),
+                            "message_count": s.get("message_count", 0),
+                        },
+                    })
+            except Exception as exc:
+                logger.warning("timeline chats failed: %s", exc)
+
+        events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+        return events[: int(limit)]
+
+    # ------------------------------------------------------------------
+    # Source suggestion mechanism
+    # ------------------------------------------------------------------
+
+    def suggest_sources(
+        self,
+        topic_collection: Optional[str] = None,
+        recent_chat_history: Optional[List[Dict[str, Any]]] = None,
+        max_suggestions: int = 6,
+    ) -> Dict[str, Any]:
+        """Suggest web sources based on conversation direction and user interests.
+
+        Uses Tavily + Gemini to build focused search queries from recent chat
+        questions, user preferences, and decisions, then returns ranked results.
+        """
+        result: Dict[str, Any] = {"suggestions": [], "queries_used": [], "error": None}
+
+        if not self.web_search_available:
+            result["error"] = "Tavily nu este configurat. Adauga cheia in bara laterala."
+            return result
+
+        recent_questions: List[str] = []
+        if recent_chat_history:
+            recent_questions = [
+                e.get("question", "")
+                for e in recent_chat_history[-5:]
+                if e.get("question")
+            ]
+
+        preferences: List[str] = []
+        decisions: List[str] = []
+        if self.repository and self.repository.enabled:
+            try:
+                prefs = self.repository.list_top_preferences(limit=5)
+                preferences = [p.get("content", "") for p in prefs if p.get("content")]
+                decs = self.repository.list_recent_decisions(limit=3)
+                decisions = [d.get("content", "") for d in decs if d.get("content")]
+            except Exception:
+                pass
+
+        queries = self._build_suggestion_queries(
+            topic_collection=topic_collection,
+            recent_questions=recent_questions,
+            preferences=preferences,
+            decisions=decisions,
+        )
+
+        if not queries:
+            result["error"] = "Nu am putut genera interogari. Incearca dupa ce ai pus cel putin o intrebare."
+            return result
+
+        seen_urls: set = set()
+        per_query = max(2, (max_suggestions + len(queries) - 1) // len(queries))
+
+        for query in queries:
+            sources = self._fetch_external_sources(query, max_results=per_query + 1)
+            for s in sources:
+                url = s.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                result["suggestions"].append({
+                    "title": s.get("title", url),
+                    "url": url,
+                    "snippet": s.get("snippet", ""),
+                    "query_used": query,
+                })
+            result["queries_used"].append(query)
+            if len(result["suggestions"]) >= max_suggestions:
+                break
+
+        result["suggestions"] = result["suggestions"][:max_suggestions]
+        if not result["suggestions"]:
+            result["error"] = "Nu s-au gasit sugestii pentru directia curenta a conversatiei."
+        return result
+
+    def _build_suggestion_queries(
+        self,
+        topic_collection: Optional[str],
+        recent_questions: List[str],
+        preferences: List[str],
+        decisions: List[str],
+    ) -> List[str]:
+        """Use Gemini to extract 2-3 focused web search queries from conversation context."""
+        if not recent_questions and not topic_collection and not preferences:
+            return []
+
+        context_parts: List[str] = []
+        if topic_collection:
+            context_parts.append(f"Subiect de lucru: {topic_collection}")
+        if recent_questions:
+            q_text = "\n".join(f"- {q}" for q in recent_questions[-4:])
+            context_parts.append(f"Intrebari recente ale utilizatorului:\n{q_text}")
+        if preferences:
+            p_text = "\n".join(f"- {p}" for p in preferences[:3])
+            context_parts.append(f"Interese / preferinte cunoscute:\n{p_text}")
+        if decisions:
+            d_text = "\n".join(f"- {d}" for d in decisions[:2])
+            context_parts.append(f"Decizii recente:\n{d_text}")
+
+        context_text = "\n\n".join(context_parts)
+
+        prompt = (
+            "Pe baza contextului de mai jos, genereaza 2-3 interogari de cautare web "
+            "concise, in engleza, pentru a gasi resurse utile (articole, tutoriale, "
+            "documentatie, papers, ghiduri) relevante pentru utilizator. "
+            "Fiecare interogare sa fie specifica si diferita. "
+            "Raspunde DOAR cu interogari, una pe linie, fara numerotare sau explicatii.\n\n"
+            f"{context_text}"
+        )
+
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            raw = self.llm.generate(prompt)
+            queries = [
+                line.strip()
+                for line in raw.strip().split("\n")
+                if line.strip() and len(line.strip()) > 5
+            ]
+            return queries[:3]
+        except Exception as exc:
+            logger.warning("_build_suggestion_queries failed: %s", exc)
+            return [q for q in recent_questions[-2:] if q]
+
+    def list_all_tasks(
+        self,
+        topic_collection: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """List tasks cu filtre optionale (topic / status). Folosit in Tasks view."""
+        if self.repository and self.repository.enabled:
+            return self.repository.list_tasks(
+                topic_collection=topic_collection,
+                status=status,
+                limit=limit,
+            ) or []
+        return []
+
+    def list_due_soon_tasks(self, within_days: int = 7, limit: int = 20) -> List[Dict[str, Any]]:
+        """Tasks cu due_at apropiat sau expirate (open/in_progress)."""
+        if self.repository and self.repository.enabled:
+            return self.repository.list_due_soon_tasks(within_days=within_days, limit=limit) or []
+        return []
+
+    def create_task_manual(
+        self,
+        title: str,
+        details: str = "",
+        topic_collection: str = "",
+        priority: str = "normal",
+        due_at: Optional[str] = None,
+    ) -> Optional[int]:
+        """Creeaza un task manual (quick capture din UI)."""
+        if self.repository and self.repository.enabled:
+            return self.repository.create_task(
+                title=title,
+                details=details,
+                topic_collection=topic_collection,
+                priority=priority,
+                due_at=due_at,
+                confidence=1.0,
+            )
+        return None
+
+    def update_task(
+        self,
+        task_id: int,
+        title: Optional[str] = None,
+        details: Optional[str] = None,
+        priority: Optional[str] = None,
+        due_at: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+    ) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.update_task(
+                task_id=task_id,
+                title=title,
+                details=details,
+                priority=priority,
+                due_at=due_at,
+                topic_collection=topic_collection,
+            )
+        return False
+
+    def update_task_status(self, task_id: int, status: str) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.update_task_status(task_id=task_id, status=status)
+        return False
+
+    def delete_task(self, task_id: int) -> bool:
+        if self.repository and self.repository.enabled:
+            return self.repository.delete_task(task_id=task_id)
+        return False
+
+    def list_open_tasks(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Returns open + in_progress tasks across all topics."""
+        if self.repository and self.repository.enabled:
+            tasks = self.repository.list_tasks(status="open", limit=limit) or []
+            in_progress = self.repository.list_tasks(status="in_progress", limit=limit) or []
+            combined = tasks + in_progress
+            combined.sort(key=lambda t: t.get("updated_at", ""), reverse=True)
+            return combined[:limit]
+        return []
+
+    def is_reindex_recommended(self) -> bool:
+        """True daca embedding model a fost schimbat fata de ultima indexare."""
+        cache = getattr(self.retriever, "embeddings_cache", None)
+        if not cache or not hasattr(cache, "is_reindex_pending"):
+            return False
+        try:
+            return bool(cache.is_reindex_pending())
+        except Exception:
+            return False
+
+    def reindex_all_documents(
+        self,
+        file_paths: List[str],
+        metadata_by_path: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Sterge toate embeddings (cache + DB) si reindexeaza toate documentele.
+
+        Apelata dupa schimbarea modelului de embedding (de ex. la trecerea la multilingv).
+        Returneaza summary cu counters + duratele.
+        """
+        summary: Dict[str, Any] = {
+            "success": False,
+            "chunks_deleted": 0,
+            "documents_reset": 0,
+            "documents_reindexed": 0,
+            "duration_s": 0.0,
+        }
+        start_time = time.time()
+
+        try:
+            # 1. Curata cache local.
+            if hasattr(self.retriever, "embeddings_cache") and self.retriever.embeddings_cache:
+                self.retriever.embeddings_cache.clear_cache()
+
+            # 2. Reset stare retriever in-memory.
+            self.retriever.documents = []
+            self.retriever.document_embeddings = []
+            self.retriever.chunk_lookup = {}
+
+            # 3. Sterge embeddings si chunks din DB.
+            if self.repository and self.repository.enabled:
+                db_result = self.repository.clear_all_embeddings()
+                summary["chunks_deleted"] = int(db_result.get("chunks_deleted", 0))
+                summary["documents_reset"] = int(db_result.get("documents_reset", 0))
+
+            # 4. Reindex cu noul model.
+            if file_paths:
+                loaded = self.load_documents(file_paths, metadata_by_path=metadata_by_path)
+                if loaded:
+                    summary["documents_reindexed"] = len(file_paths)
+
+            # 5. Confirma reindexarea la nivel de cache signature.
+            if hasattr(self.retriever, "embeddings_cache") and self.retriever.embeddings_cache:
+                if hasattr(self.retriever.embeddings_cache, "mark_reindex_complete"):
+                    self.retriever.embeddings_cache.mark_reindex_complete()
+
+            summary["success"] = True
+        except Exception as exc:
+            logger.error("reindex_all_documents failed: %s", exc)
+            summary["success"] = False
+            summary["error"] = str(exc)
+
+        summary["duration_s"] = round(time.time() - start_time, 2)
+        logger.info("reindex_all_documents summary: %s", summary)
+        return summary
+
     def clear_embeddings_cache(self):
         """Curată cache-ul de embeddings"""
         if hasattr(self.retriever, 'embeddings_cache'):
@@ -2776,8 +4184,8 @@ INSTRUCȚIUNI:
             self.cache_manager.clear_cache()
             logger.info("Cache-ul a fost curățat")
 
-def create_apci_system(api_key: str, config_dict: Dict[str, Any] = None) -> APCISystem:
-    """Factory function pentru crearea sistemului APCI"""
+def create_apci_system(api_key: str, config_dict: Dict[str, Any] = None) -> CerebrumAISystem:
+    """Factory function pentru crearea sistemului CerebrumAI"""
     
     # Configurare implicită
     default_config = RAGConfig()
@@ -2788,11 +4196,11 @@ def create_apci_system(api_key: str, config_dict: Dict[str, Any] = None) -> APCI
             if hasattr(default_config, key):
                 setattr(default_config, key, value)
     
-    return APCISystem(default_config, api_key)
+    return CerebrumAISystem(default_config, api_key)
 
 # Export principal
 __all__ = [
-    'APCISystem', 
+    'CerebrumAISystem', 
     'RAGConfig', 
     'create_apci_system',
     'OptimizedFlashLLM',

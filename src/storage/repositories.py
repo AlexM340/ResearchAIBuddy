@@ -136,7 +136,7 @@ class SecondBrainRepository:
 
                     chunk_ids: List[int] = []
                     for idx, chunk in enumerate(chunks):
-                        content = chunk.get("content", "")
+                        content = (chunk.get("content", "") or "").replace("\x00", "")
                         metadata = chunk.get("metadata", {})
                         token_count = max(1, len(content) // 4)
                         cur.execute(
@@ -1063,6 +1063,272 @@ class SecondBrainRepository:
             logger.error("search_episodes failed: %s", exc)
             return []
 
+    # ------------------------------------------------------------------
+    # Notes — user-authored Second Brain primitive
+    # ------------------------------------------------------------------
+
+    def create_note(
+        self,
+        content: str,
+        title: str = "",
+        topic_collection: str = "",
+        tags: Optional[List[str]] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[int]:
+        """Persist a user-authored note + optional vector embedding."""
+        if not self.enabled or not content or not content.strip():
+            return None
+        clean_tags = [t.strip() for t in (tags or []) if t and t.strip()]
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO notes(title, content, topic_collection, tags, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW(), NOW())
+                        RETURNING id;
+                        """,
+                        (title.strip(), content.strip(), (topic_collection or "").strip(), clean_tags),
+                    )
+                    row = cur.fetchone()
+                    note_id = int(row[0]) if row else None
+                    if note_id is not None and embedding is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO note_embeddings(note_id, embedding, created_at)
+                            VALUES (%s, %s::vector, NOW())
+                            ON CONFLICT(note_id) DO UPDATE SET
+                                embedding = EXCLUDED.embedding,
+                                created_at = NOW();
+                            """,
+                            (note_id, _vector_literal(embedding)),
+                        )
+                conn.commit()
+            return note_id
+        except Exception as exc:
+            logger.error("create_note failed: %s", exc)
+            return None
+
+    def update_note(
+        self,
+        note_id: int,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> bool:
+        """Patch a note. Pass only the fields you want to change."""
+        if not self.enabled:
+            return False
+        sets: List[str] = []
+        params: List[Any] = []
+        if title is not None:
+            sets.append("title = %s")
+            params.append(title.strip())
+        if content is not None:
+            sets.append("content = %s")
+            params.append(content.strip())
+        if topic_collection is not None:
+            sets.append("topic_collection = %s")
+            params.append(topic_collection.strip())
+        if tags is not None:
+            sets.append("tags = %s")
+            params.append([t.strip() for t in tags if t and t.strip()])
+        if not sets and embedding is None:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    if sets:
+                        sets.append("updated_at = NOW()")
+                        sql = f"UPDATE notes SET {', '.join(sets)} WHERE id = %s;"
+                        cur.execute(sql, (*params, int(note_id)))
+                    if embedding is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO note_embeddings(note_id, embedding, created_at)
+                            VALUES (%s, %s::vector, NOW())
+                            ON CONFLICT(note_id) DO UPDATE SET
+                                embedding = EXCLUDED.embedding,
+                                created_at = NOW();
+                            """,
+                            (int(note_id), _vector_literal(embedding)),
+                        )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("update_note failed: %s", exc)
+            return False
+
+    def delete_note(self, note_id: int) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM notes WHERE id = %s;", (int(note_id),))
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("delete_note failed: %s", exc)
+            return False
+
+    def get_note(self, note_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, content, topic_collection, tags, created_at, updated_at
+                        FROM notes WHERE id = %s;
+                        """,
+                        (int(note_id),),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "title": row[1] or "",
+                "content": row[2] or "",
+                "topic_collection": row[3] or "",
+                "tags": list(row[4] or []),
+                "created_at": row[5].isoformat() if row[5] else "",
+                "updated_at": row[6].isoformat() if row[6] else "",
+            }
+        except Exception as exc:
+            logger.error("get_note failed: %s", exc)
+            return None
+
+    def list_notes(
+        self,
+        topic_collection: Optional[str] = None,
+        text_query: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List notes ordered by updated_at desc, with optional topic + full-text filter."""
+        if not self.enabled:
+            return []
+        clauses: List[str] = []
+        params: List[Any] = []
+        if topic_collection is not None and topic_collection.strip():
+            clauses.append("topic_collection = %s")
+            params.append(topic_collection.strip())
+        if text_query and text_query.strip():
+            clauses.append(
+                "to_tsvector('simple', coalesce(title, '') || ' ' || content) @@ plainto_tsquery('simple', %s)"
+            )
+            params.append(text_query.strip())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, title, content, topic_collection, tags, created_at, updated_at
+                        FROM notes
+                        {where}
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        tuple(params),
+                    )
+                    rows = cur.fetchall()
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1] or "",
+                    "content": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "tags": list(row[4] or []),
+                    "created_at": row[5].isoformat() if row[5] else "",
+                    "updated_at": row[6].isoformat() if row[6] else "",
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_notes failed: %s", exc)
+            return []
+
+    def vector_search_notes(
+        self,
+        query_embedding: List[float],
+        topic_collection: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Cosine-similarity search over note embeddings."""
+        if not self.enabled:
+            return []
+        try:
+            vector_sql = _vector_literal(query_embedding)
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    if topic_collection and topic_collection.strip():
+                        cur.execute(
+                            """
+                            SELECT
+                                notes.id, notes.title, notes.content, notes.topic_collection,
+                                notes.tags, notes.created_at, notes.updated_at,
+                                (1 - (note_embeddings.embedding <=> %s::vector)) AS similarity
+                            FROM note_embeddings
+                            JOIN notes ON notes.id = note_embeddings.note_id
+                            WHERE notes.topic_collection = %s
+                            ORDER BY note_embeddings.embedding <=> %s::vector
+                            LIMIT %s;
+                            """,
+                            (vector_sql, topic_collection.strip(), vector_sql, int(top_k)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT
+                                notes.id, notes.title, notes.content, notes.topic_collection,
+                                notes.tags, notes.created_at, notes.updated_at,
+                                (1 - (note_embeddings.embedding <=> %s::vector)) AS similarity
+                            FROM note_embeddings
+                            JOIN notes ON notes.id = note_embeddings.note_id
+                            ORDER BY note_embeddings.embedding <=> %s::vector
+                            LIMIT %s;
+                            """,
+                            (vector_sql, vector_sql, int(top_k)),
+                        )
+                    rows = cur.fetchall()
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1] or "",
+                    "content": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "tags": list(row[4] or []),
+                    "created_at": row[5].isoformat() if row[5] else "",
+                    "updated_at": row[6].isoformat() if row[6] else "",
+                    "similarity": float(row[7] or 0.0),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("vector_search_notes failed: %s", exc)
+            return []
+
     def create_task(
         self,
         title: str,
@@ -1216,6 +1482,137 @@ class SecondBrainRepository:
             logger.error("list_tasks failed: %s", exc)
             return []
 
+    def update_task(
+        self,
+        task_id: int,
+        title: Optional[str] = None,
+        details: Optional[str] = None,
+        priority: Optional[str] = None,
+        due_at: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+    ) -> bool:
+        """Update partial al unui task. None = nu modifica acel camp.
+
+        Pentru due_at: trimite '' pentru a curata data scadenta.
+        """
+        if not self.enabled:
+            return False
+
+        sets: List[str] = []
+        params: List[Any] = []
+
+        if title is not None:
+            clean_title = title.strip()
+            if not clean_title:
+                return False
+            sets.append("title = %s")
+            params.append(clean_title)
+
+        if details is not None:
+            sets.append("details = %s")
+            params.append(details.strip())
+
+        if priority is not None:
+            clean_priority = (priority or "normal").strip().lower()
+            if clean_priority not in {"low", "normal", "high"}:
+                clean_priority = "normal"
+            sets.append("priority = %s")
+            params.append(clean_priority)
+
+        if due_at is not None:
+            # '' sau None-ish trimis explicit -> NULL in DB
+            value = due_at.strip() if isinstance(due_at, str) else due_at
+            sets.append("due_at = %s")
+            params.append(value if value else None)
+
+        if topic_collection is not None:
+            sets.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+
+        if not sets:
+            return False
+
+        sets.append("updated_at = NOW()")
+        params.append(int(task_id))
+        sql = f"UPDATE tasks SET {', '.join(sets)} WHERE id = %s;"
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(params))
+                    updated = cur.rowcount > 0
+                conn.commit()
+            return updated
+        except Exception as exc:
+            logger.error("update_task failed: %s", exc)
+            return False
+
+    def delete_task(self, task_id: int) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM tasks WHERE id = %s;", (int(task_id),))
+                    deleted = cur.rowcount > 0
+                conn.commit()
+            return deleted
+        except Exception as exc:
+            logger.error("delete_task failed: %s", exc)
+            return False
+
+    def list_due_soon_tasks(
+        self,
+        within_days: int = 7,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Tasks cu due_at in urmatoarele N zile sau deja expirate (status open/in_progress)."""
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, details, topic_collection, status, priority, due_at, confidence, created_at, updated_at,
+                               EXTRACT(EPOCH FROM (due_at - NOW()))/86400.0 AS days_until_due
+                        FROM tasks
+                        WHERE status IN ('open', 'in_progress')
+                          AND due_at IS NOT NULL
+                          AND due_at <= NOW() + (%s || ' days')::INTERVAL
+                        ORDER BY due_at ASC
+                        LIMIT %s;
+                        """,
+                        (int(within_days), int(limit)),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1],
+                    "details": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "status": row[4] or "open",
+                    "priority": row[5] or "normal",
+                    "due_at": row[6].isoformat() if hasattr(row[6], "isoformat") else (str(row[6]) if row[6] else None),
+                    "confidence": float(row[7] or 0.0),
+                    "created_at": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+                    "updated_at": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+                    "days_until_due": float(row[10] or 0.0),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_due_soon_tasks failed: %s", exc)
+            return []
+
     def update_task_status(self, task_id: int, status: str) -> bool:
         if not self.enabled:
             return False
@@ -1322,6 +1719,471 @@ class SecondBrainRepository:
             logger.error("search_tasks failed: %s", exc)
             return []
 
+    def update_decision(
+        self,
+        decision_id: int,
+        title: Optional[str] = None,
+        rationale: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> bool:
+        """Partial update pentru o decizie. None = nu modifica."""
+        if not self.enabled:
+            return False
+
+        sets: List[str] = []
+        params: List[Any] = []
+
+        if title is not None:
+            clean_title = title.strip()
+            if not clean_title:
+                return False
+            sets.append("title = %s")
+            params.append(clean_title)
+
+        if rationale is not None:
+            sets.append("rationale = %s")
+            params.append(rationale.strip())
+
+        if topic_collection is not None:
+            sets.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+
+        if confidence is not None:
+            sets.append("confidence = %s")
+            params.append(float(confidence))
+
+        if not sets:
+            return False
+
+        params.append(int(decision_id))
+        sql = f"UPDATE decisions SET {', '.join(sets)} WHERE id = %s;"
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(params))
+                    updated = cur.rowcount > 0
+                conn.commit()
+            return updated
+        except Exception as exc:
+            logger.error("update_decision failed: %s", exc)
+            return False
+
+    def delete_decision(self, decision_id: int) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM decisions WHERE id = %s;", (int(decision_id),))
+                    deleted = cur.rowcount > 0
+                conn.commit()
+            return deleted
+        except Exception as exc:
+            logger.error("delete_decision failed: %s", exc)
+            return False
+
+    def list_all_decisions(
+        self,
+        topic_collection: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Toate deciziile (cu filtru optional pe topic)."""
+        if not self.enabled:
+            return []
+        topic = (topic_collection or "").strip()
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    if topic:
+                        cur.execute(
+                            """
+                            SELECT id, title, rationale, topic_collection, confidence, created_at
+                            FROM decisions
+                            WHERE topic_collection = %s
+                            ORDER BY created_at DESC
+                            LIMIT %s;
+                            """,
+                            (topic, int(limit)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, title, rationale, topic_collection, confidence, created_at
+                            FROM decisions
+                            ORDER BY created_at DESC
+                            LIMIT %s;
+                            """,
+                            (int(limit),),
+                        )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1],
+                    "rationale": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "confidence": float(row[4] or 0.0),
+                    "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_all_decisions failed: %s", exc)
+            return []
+
+    def update_preference(
+        self,
+        preference_id: int,
+        preference_value: Optional[str] = None,
+        confidence: Optional[float] = None,
+        topic_collection: Optional[str] = None,
+    ) -> bool:
+        if not self.enabled:
+            return False
+
+        sets: List[str] = []
+        params: List[Any] = []
+
+        if preference_value is not None:
+            clean_val = preference_value.strip()
+            if not clean_val:
+                return False
+            sets.append("preference_value = %s")
+            params.append(clean_val)
+
+        if confidence is not None:
+            sets.append("confidence = %s")
+            params.append(float(confidence))
+
+        if topic_collection is not None:
+            sets.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+
+        if not sets:
+            return False
+
+        sets.append("updated_at = NOW()")
+        params.append(int(preference_id))
+        sql = f"UPDATE preferences SET {', '.join(sets)} WHERE id = %s;"
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute(sql, tuple(params))
+                    updated = cur.rowcount > 0
+                conn.commit()
+            return updated
+        except Exception as exc:
+            logger.error("update_preference failed: %s", exc)
+            return False
+
+    def delete_preference(self, preference_id: int) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM preferences WHERE id = %s;", (int(preference_id),))
+                    deleted = cur.rowcount > 0
+                conn.commit()
+            return deleted
+        except Exception as exc:
+            logger.error("delete_preference failed: %s", exc)
+            return False
+
+    def list_all_preferences(
+        self,
+        topic_collection: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        topic = (topic_collection or "").strip()
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    if topic:
+                        cur.execute(
+                            """
+                            SELECT id, preference_key, preference_value, topic_collection, confidence, updated_at
+                            FROM preferences
+                            WHERE topic_collection = %s
+                            ORDER BY confidence DESC, updated_at DESC
+                            LIMIT %s;
+                            """,
+                            (topic, int(limit)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, preference_key, preference_value, topic_collection, confidence, updated_at
+                            FROM preferences
+                            ORDER BY confidence DESC, updated_at DESC
+                            LIMIT %s;
+                            """,
+                            (int(limit),),
+                        )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "preference_key": row[1] or "",
+                    "preference_value": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "confidence": float(row[4] or 0.0),
+                    "updated_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_all_preferences failed: %s", exc)
+            return []
+
+    def get_weekly_summary(self, days: int = 7) -> Dict[str, Any]:
+        """Sumar pentru ultimele N zile: decizii noi, task-uri inchise/deschise, documente noi."""
+        empty = {
+            "window_days": days,
+            "decisions_added": 0,
+            "tasks_added": 0,
+            "tasks_closed": 0,
+            "tasks_currently_open": 0,
+            "documents_added": 0,
+            "messages_count": 0,
+            "recent_decisions": [],
+            "recent_closed_tasks": [],
+        }
+        if not self.enabled:
+            return empty
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return empty
+                with conn.cursor() as cur:
+                    # Counters
+                    cur.execute(
+                        "SELECT COUNT(*) FROM decisions WHERE created_at >= NOW() - (%s || ' days')::INTERVAL;",
+                        (int(days),),
+                    )
+                    decisions_added = int((cur.fetchone() or [0])[0] or 0)
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE created_at >= NOW() - (%s || ' days')::INTERVAL;",
+                        (int(days),),
+                    )
+                    tasks_added = int((cur.fetchone() or [0])[0] or 0)
+
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) FROM tasks
+                        WHERE status IN ('done', 'cancelled')
+                          AND updated_at >= NOW() - (%s || ' days')::INTERVAL;
+                        """,
+                        (int(days),),
+                    )
+                    tasks_closed = int((cur.fetchone() or [0])[0] or 0)
+
+                    cur.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'in_progress');")
+                    tasks_open = int((cur.fetchone() or [0])[0] or 0)
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM documents WHERE created_at >= NOW() - (%s || ' days')::INTERVAL;",
+                        (int(days),),
+                    )
+                    documents_added = int((cur.fetchone() or [0])[0] or 0)
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM messages WHERE created_at >= NOW() - (%s || ' days')::INTERVAL;",
+                        (int(days),),
+                    )
+                    messages_count = int((cur.fetchone() or [0])[0] or 0)
+
+                    # Recent decisions list
+                    cur.execute(
+                        """
+                        SELECT id, title, topic_collection, created_at
+                        FROM decisions
+                        WHERE created_at >= NOW() - (%s || ' days')::INTERVAL
+                        ORDER BY created_at DESC
+                        LIMIT 5;
+                        """,
+                        (int(days),),
+                    )
+                    recent_decisions = [
+                        {
+                            "id": int(row[0]),
+                            "title": row[1],
+                            "topic_collection": row[2] or "",
+                            "created_at": row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+                        }
+                        for row in (cur.fetchall() or [])
+                    ]
+
+                    # Recent closed tasks
+                    cur.execute(
+                        """
+                        SELECT id, title, topic_collection, status, updated_at
+                        FROM tasks
+                        WHERE status IN ('done', 'cancelled')
+                          AND updated_at >= NOW() - (%s || ' days')::INTERVAL
+                        ORDER BY updated_at DESC
+                        LIMIT 5;
+                        """,
+                        (int(days),),
+                    )
+                    recent_closed_tasks = [
+                        {
+                            "id": int(row[0]),
+                            "title": row[1],
+                            "topic_collection": row[2] or "",
+                            "status": row[3] or "done",
+                            "updated_at": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+                        }
+                        for row in (cur.fetchall() or [])
+                    ]
+                conn.commit()
+            return {
+                "window_days": days,
+                "decisions_added": decisions_added,
+                "tasks_added": tasks_added,
+                "tasks_closed": tasks_closed,
+                "tasks_currently_open": tasks_open,
+                "documents_added": documents_added,
+                "messages_count": messages_count,
+                "recent_decisions": recent_decisions,
+                "recent_closed_tasks": recent_closed_tasks,
+            }
+        except Exception as exc:
+            logger.error("get_weekly_summary failed: %s", exc)
+            return empty
+
+    def list_recent_decisions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Returneaza cele mai recente decizii memorate, indiferent de topic."""
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, rationale, topic_collection, confidence, created_at
+                        FROM decisions
+                        ORDER BY created_at DESC
+                        LIMIT %s;
+                        """,
+                        (int(limit),),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1],
+                    "rationale": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "confidence": float(row[4] or 0.0),
+                    "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_recent_decisions failed: %s", exc)
+            return []
+
+    def list_aged_decisions(
+        self,
+        min_age_days: int = 30,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Decizii mai vechi decat min_age_days, candidati pentru review (drift)."""
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, rationale, topic_collection, confidence, created_at,
+                               EXTRACT(DAY FROM NOW() - created_at)::INT AS age_days
+                        FROM decisions
+                        WHERE created_at < NOW() - (%s || ' days')::INTERVAL
+                        ORDER BY created_at ASC
+                        LIMIT %s;
+                        """,
+                        (int(min_age_days), int(limit)),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "title": row[1],
+                    "rationale": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "confidence": float(row[4] or 0.0),
+                    "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                    "age_days": int(row[6] or 0),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_aged_decisions failed: %s", exc)
+            return []
+
+    def list_top_preferences(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Returneaza preferintele cu cea mai mare confidence."""
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, preference_key, preference_value, topic_collection, confidence, updated_at
+                        FROM preferences
+                        ORDER BY confidence DESC, updated_at DESC
+                        LIMIT %s;
+                        """,
+                        (int(limit),),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "preference_key": row[1] or "",
+                    "preference_value": row[2] or "",
+                    "topic_collection": row[3] or "",
+                    "confidence": float(row[4] or 0.0),
+                    "updated_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_top_preferences failed: %s", exc)
+            return []
+
     def get_second_brain_status(self) -> Dict[str, Any]:
         default_status = {
             "decisions_count": 0,
@@ -1360,6 +2222,40 @@ class SecondBrainRepository:
             logger.error("get_second_brain_status failed: %s", exc)
             return default_status
 
+    def clear_all_embeddings(self) -> Dict[str, int]:
+        """Sterge toate embeddings + chunks si reseteaza documents.indexed.
+
+        Folosit la reindexare completa (de ex. dupa schimbarea modelului de embedding).
+        Returneaza counters: {chunks_deleted, embeddings_deleted, documents_reset}.
+        """
+        result = {"chunks_deleted": 0, "embeddings_deleted": 0, "documents_reset": 0}
+        if not self.enabled:
+            return result
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return result
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM chunk_embeddings;")
+                    result["embeddings_deleted"] = int((cur.fetchone() or [0])[0] or 0)
+                    cur.execute("SELECT COUNT(*) FROM chunks;")
+                    result["chunks_deleted"] = int((cur.fetchone() or [0])[0] or 0)
+                    cur.execute("SELECT COUNT(*) FROM documents WHERE indexed = TRUE;")
+                    result["documents_reset"] = int((cur.fetchone() or [0])[0] or 0)
+
+                    # CASCADE pe chunks va sterge si chunk_embeddings.
+                    cur.execute("DELETE FROM chunks;")
+                    cur.execute("UPDATE documents SET indexed = FALSE, updated_at = NOW();")
+                conn.commit()
+            logger.info(
+                "clear_all_embeddings: removed %d chunks / %d embeddings, reset %d documents",
+                result["chunks_deleted"], result["embeddings_deleted"], result["documents_reset"],
+            )
+            return result
+        except Exception as exc:
+            logger.error("clear_all_embeddings failed: %s", exc)
+            return result
+
     def log_retrieval(
         self,
         question: str,
@@ -1387,6 +2283,121 @@ class SecondBrainRepository:
         except Exception as exc:
             logger.error("log_retrieval failed: %s", exc)
             return False
+
+    def list_retrieval_logs(
+        self,
+        limit: int = 100,
+        route_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returneaza ultimele N retrieval logs (cu filtru optional pe route)."""
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    if route_filter:
+                        cur.execute(
+                            """
+                            SELECT id, question, route_used, latency_ms, metrics_json, created_at
+                            FROM retrieval_logs
+                            WHERE route_used = %s
+                            ORDER BY created_at DESC
+                            LIMIT %s;
+                            """,
+                            (route_filter, int(limit)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, question, route_used, latency_ms, metrics_json, created_at
+                            FROM retrieval_logs
+                            ORDER BY created_at DESC
+                            LIMIT %s;
+                            """,
+                            (int(limit),),
+                        )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "question": row[1] or "",
+                    "route_used": row[2] or "",
+                    "latency_ms": float(row[3] or 0.0),
+                    "metrics": row[4] if isinstance(row[4], dict) else (json.loads(row[4]) if row[4] else {}),
+                    "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_retrieval_logs failed: %s", exc)
+            return []
+
+    def get_retrieval_stats(self, days: int = 7) -> Dict[str, Any]:
+        """Statistici pe retrieval_logs in ultima fereastra de N zile (avg/p95/route distribution)."""
+        empty = {
+            "window_days": days,
+            "total": 0,
+            "by_route": {},
+            "latency_ms_avg": 0.0,
+            "latency_ms_p50": 0.0,
+            "latency_ms_p95": 0.0,
+        }
+        if not self.enabled:
+            return empty
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return empty
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*),
+                               COALESCE(AVG(latency_ms), 0),
+                               COALESCE(PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY latency_ms), 0),
+                               COALESCE(PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)
+                        FROM retrieval_logs
+                        WHERE created_at >= NOW() - (%s || ' days')::INTERVAL;
+                        """,
+                        (int(days),),
+                    )
+                    row = cur.fetchone() or (0, 0.0, 0.0, 0.0)
+                    total = int(row[0] or 0)
+                    avg = float(row[1] or 0.0)
+                    p50 = float(row[2] or 0.0)
+                    p95 = float(row[3] or 0.0)
+
+                    cur.execute(
+                        """
+                        SELECT route_used, COUNT(*) AS n, COALESCE(AVG(latency_ms), 0) AS avg_lat
+                        FROM retrieval_logs
+                        WHERE created_at >= NOW() - (%s || ' days')::INTERVAL
+                        GROUP BY route_used
+                        ORDER BY n DESC;
+                        """,
+                        (int(days),),
+                    )
+                    by_route_rows = cur.fetchall() or []
+                conn.commit()
+            return {
+                "window_days": days,
+                "total": total,
+                "latency_ms_avg": round(avg, 1),
+                "latency_ms_p50": round(p50, 1),
+                "latency_ms_p95": round(p95, 1),
+                "by_route": {
+                    (r[0] or "unknown"): {
+                        "count": int(r[1] or 0),
+                        "latency_ms_avg": round(float(r[2] or 0.0), 1),
+                    }
+                    for r in by_route_rows
+                },
+            }
+        except Exception as exc:
+            logger.error("get_retrieval_stats failed: %s", exc)
+            return empty
 
     def get_index_status(self) -> Dict[str, Any]:
         """Return indexed documents/chunks counters for startup bootstrap."""
@@ -1440,6 +2451,72 @@ class SecondBrainRepository:
         except Exception as exc:
             logger.error("get_index_status failed: %s", exc)
             return default_status
+
+    def list_recent_documents(
+        self,
+        topic_collection: Optional[str] = None,
+        days: int = 30,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return documents ordered by created_at desc, with optional topic + recency filters.
+
+        Used by the Timeline view to surface "documents added recently" events.
+        """
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    if topic_collection is not None and topic_collection.strip():
+                        cur.execute(
+                            """
+                            SELECT
+                                d.id, d.original_name, d.source_path, d.indexed,
+                                c.name AS collection_name,
+                                d.created_at, d.updated_at
+                            FROM documents d
+                            JOIN collections c ON c.id = d.collection_id
+                            WHERE c.name = %s
+                              AND d.created_at >= NOW() - (%s || ' days')::INTERVAL
+                            ORDER BY d.created_at DESC
+                            LIMIT %s;
+                            """,
+                            (topic_collection.strip(), int(days), int(limit)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT
+                                d.id, d.original_name, d.source_path, d.indexed,
+                                c.name AS collection_name,
+                                d.created_at, d.updated_at
+                            FROM documents d
+                            JOIN collections c ON c.id = d.collection_id
+                            WHERE d.created_at >= NOW() - (%s || ' days')::INTERVAL
+                            ORDER BY d.created_at DESC
+                            LIMIT %s;
+                            """,
+                            (int(days), int(limit)),
+                        )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "original_name": row[1] or "",
+                    "source_path": row[2] or "",
+                    "indexed": bool(row[3]),
+                    "collection_name": row[4] or "",
+                    "created_at": row[5].isoformat() if row[5] else "",
+                    "updated_at": row[6].isoformat() if row[6] else "",
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_recent_documents failed: %s", exc)
+            return []
 
     def is_file_hash_indexed(self, file_hash: str) -> bool:
         """Return True when file hash exists and document is already indexed."""

@@ -1,5 +1,5 @@
 """
-Manager pentru documentele bibliotecii APCI
+Manager pentru documentele bibliotecii CerebrumAI
 Gestionează persistența și managementul documentelor încărcate
 """
 
@@ -217,6 +217,27 @@ class DocumentManager:
         self._save_metadata()
         return True
     
+    def delete_collection(self, name: str) -> bool:
+        """Sterge o colectie si toate documentele ei."""
+        try:
+            if name not in self.metadata["collections"]:
+                return False
+            doc_ids = list(self.metadata["collections"][name].get("documents", []))
+            for doc_id in doc_ids:
+                doc_info = self.metadata["documents"].get(doc_id)
+                if doc_info:
+                    library_file_path = self.library_path / doc_info["library_path"]
+                    if library_file_path.exists():
+                        library_file_path.unlink()
+                    del self.metadata["documents"][doc_id]
+            del self.metadata["collections"][name]
+            self._save_metadata()
+            logger.info(f"Colectie stearsa: {name} ({len(doc_ids)} documente)")
+            return True
+        except Exception as e:
+            logger.error(f"Eroare la stergerea colectiei {name}: {e}")
+            return False
+
     def move_document_to_collection(self, doc_id: str, new_collection: str) -> bool:
         """Mută un document într-o colecție nouă"""
         try:

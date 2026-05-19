@@ -7,7 +7,7 @@
         "primary_llm": "gemini-2.5-flash",
         "fallback_llm": "gemini-2.0-flash-exp",
         "local_llm": "llama3:instruct",
-        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         "evaluation_model": "gemini-2.5-flash"
     },
     "gemini": {
@@ -46,6 +46,18 @@
         "neo4j_uri": "neo4j+s://b42979c2.databases.neo4j.io",
         "neo4j_user": "neo4j",
         "neo4j_password": ""
+    },
+    "retrieval_quality": {
+        "enable_reranker": true,
+        "reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        "reranker_input_k": 20,
+        "enable_hyde": false,
+        "hyde_max_tokens": 200
+    },
+    "web_search": {
+        "enable_web_fallback": true,
+        "max_results": 5,
+        "search_depth": "advanced"
     },
     "second_brain": {
         "enable_graph_rag": true,
