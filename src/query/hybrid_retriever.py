@@ -78,6 +78,8 @@ class HybridEvidenceFusion:
             source_ref = {
                 "concept": item.get("concept", ""),
                 "document_id": item.get("document_id", ""),
+                "artifact_id": item.get("artifact_id", ""),
+                "artifact_type": item.get("artifact_type", ""),
                 "filename": item.get("filename", ""),
                 "collection": item.get("collection", ""),
                 "path": item.get("path", []),
@@ -120,4 +122,3 @@ class HybridEvidenceFusion:
         if abs(maximum - minimum) < 1e-9:
             return [1.0 if value > 0 else 0.0 for value in values]
         return [(value - minimum) / (maximum - minimum) for value in values]
-

@@ -29,6 +29,18 @@ _EVENT_TYPE_LABELS = {
     "chat_started": "💬 Chat-uri",
 }
 
+_EVENT_TYPE_LABELS.update({
+    "note_deleted": "Note sterse",
+    "decision_updated": "Decizii editate",
+    "decision_deleted": "Decizii sterse",
+    "preference_updated": "Preferinte",
+    "preference_deleted": "Preferinte sterse",
+    "task_updated": "Task-uri editate",
+    "task_deleted": "Task-uri sterse",
+    "episode_captured": "Episoade chat",
+    "synthesis_created": "Sinteze",
+})
+
 _WINDOW_OPTIONS = [
     ("Ultima zi", 1),
     ("Ultimele 3 zile", 3),

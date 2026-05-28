@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 import streamlit as st
 
+from views._documents import save_text_as_document
 from views._shared import (
     DEFAULT_CHAT_TITLE,
     clear_active_chat,
@@ -259,6 +260,8 @@ def _render_second_brain_panels() -> None:
         return
 
     _render_weekly_digest(apci_system)
+    _render_memory_inbox(apci_system)
+    _render_global_analysis(apci_system)
 
     panel_left, panel_right = st.columns(2)
 
@@ -270,6 +273,219 @@ def _render_second_brain_panels() -> None:
 
     _render_memory_editor(apci_system)
     _render_contradictions(apci_system)
+
+
+def _render_memory_inbox(apci_system) -> None:
+    """Persistent inbox for medium-confidence memory proposals."""
+    if not hasattr(apci_system, "list_memory_proposals"):
+        return
+
+    try:
+        proposals = apci_system.list_memory_proposals(status="pending", limit=30) or []
+    except Exception:
+        proposals = []
+
+    with st.expander(f"Inbox memorie ({len(proposals)})", expanded=bool(proposals)):
+        st.caption("Propuneri detectate din conversatii. Accepta doar elementele corecte.")
+        if not proposals:
+            st.info("Nu exista propuneri pending.")
+            return
+
+        for proposal in proposals:
+            _render_memory_proposal_card(apci_system, proposal)
+
+
+def _render_memory_proposal_card(apci_system, proposal: Dict[str, Any]) -> None:
+    proposal_id = int(proposal.get("id"))
+    proposal_type = proposal.get("proposal_type", "memory")
+    payload = dict(proposal.get("payload") or {})
+    topic = payload.get("topic_collection", proposal.get("topic_collection", "")) or ""
+    confidence = float(proposal.get("confidence", payload.get("confidence", 0.0)) or 0.0)
+
+    with st.container(border=True):
+        st.markdown(f"**{_proposal_title(proposal_type, payload)}**")
+        st.caption(f"{proposal_type} | {topic or 'global'} | confidence={confidence:.0%}")
+
+        with st.form(f"memory_proposal_form_{proposal_id}"):
+            edited_payload: Dict[str, Any] = {"topic_collection": topic}
+
+            if proposal_type == "note":
+                edited_payload["title"] = st.text_input(
+                    "Titlu",
+                    value=payload.get("title", ""),
+                    key=f"mp_title_{proposal_id}",
+                )
+                edited_payload["content"] = st.text_area(
+                    "Continut",
+                    value=payload.get("content", ""),
+                    height=120,
+                    key=f"mp_content_{proposal_id}",
+                )
+            elif proposal_type == "task":
+                edited_payload["title"] = st.text_input(
+                    "Titlu",
+                    value=payload.get("title", ""),
+                    key=f"mp_task_title_{proposal_id}",
+                )
+                edited_payload["details"] = st.text_area(
+                    "Detalii",
+                    value=payload.get("details", ""),
+                    height=100,
+                    key=f"mp_task_details_{proposal_id}",
+                )
+                col_priority, col_due = st.columns(2)
+                with col_priority:
+                    edited_payload["priority"] = st.selectbox(
+                        "Prioritate",
+                        options=["low", "normal", "high"],
+                        index=["low", "normal", "high"].index(payload.get("priority", "normal"))
+                        if payload.get("priority", "normal") in {"low", "normal", "high"} else 1,
+                        key=f"mp_task_priority_{proposal_id}",
+                    )
+                with col_due:
+                    edited_payload["due_at"] = st.text_input(
+                        "Due date",
+                        value=payload.get("due_at") or "",
+                        key=f"mp_task_due_{proposal_id}",
+                    ) or None
+            elif proposal_type == "decision":
+                edited_payload["title"] = st.text_input(
+                    "Titlu",
+                    value=payload.get("title", ""),
+                    key=f"mp_decision_title_{proposal_id}",
+                )
+                edited_payload["rationale"] = st.text_area(
+                    "Rationale",
+                    value=payload.get("rationale", ""),
+                    height=120,
+                    key=f"mp_decision_rationale_{proposal_id}",
+                )
+            elif proposal_type == "preference":
+                edited_payload["preference_key"] = st.text_input(
+                    "Cheie",
+                    value=payload.get("preference_key", "user_preference"),
+                    key=f"mp_pref_key_{proposal_id}",
+                )
+                edited_payload["preference_value"] = st.text_area(
+                    "Valoare",
+                    value=payload.get("preference_value", ""),
+                    height=100,
+                    key=f"mp_pref_value_{proposal_id}",
+                )
+            else:
+                st.json(payload)
+
+            edited_payload["topic_collection"] = st.text_input(
+                "Notebook/topic",
+                value=topic,
+                key=f"mp_topic_{proposal_id}",
+            )
+
+            col_accept, col_dismiss = st.columns(2)
+            with col_accept:
+                accept = st.form_submit_button("Accepta", type="primary", use_container_width=True)
+            with col_dismiss:
+                dismiss = st.form_submit_button("Dismiss", use_container_width=True)
+
+        if accept:
+            if apci_system.accept_memory_proposal(proposal_id, edited_payload):
+                st.success("Propunere salvata.")
+                st.rerun()
+            else:
+                st.error("Nu am putut salva propunerea.")
+        if dismiss:
+            if apci_system.dismiss_memory_proposal(proposal_id):
+                st.rerun()
+            else:
+                st.error("Nu am putut marca propunerea ca dismissed.")
+
+
+def _proposal_title(proposal_type: str, payload: Dict[str, Any]) -> str:
+    if proposal_type == "preference":
+        return f"Preferinta: {payload.get('preference_key', 'preferinta')}"
+    return payload.get("title") or f"Propunere {proposal_type}"
+
+
+def _render_global_analysis(apci_system) -> None:
+    """Global synthesis, taxonomy and gap analysis for all Second Brain sources."""
+    synth_key = "sb_global_synthesis"
+    taxonomy_key = "sb_global_taxonomy"
+    gaps_key = "sb_global_gaps"
+
+    with st.expander("Analize globale", expanded=False):
+        col_synth, col_tax, col_gap, col_clear = st.columns([1, 1, 1, 1])
+        with col_synth:
+            if st.button("Sinteza globala", key="sb_global_synth_btn", use_container_width=True):
+                with st.spinner("Sintetizez tot Second Brain-ul..."):
+                    st.session_state[synth_key] = apci_system.synthesize_topic("")
+                st.rerun()
+        with col_tax:
+            if st.button("Taxonomie globala", key="sb_global_tax_btn", use_container_width=True):
+                with st.spinner("Construiesc taxonomia globala..."):
+                    st.session_state[taxonomy_key] = apci_system.analyze_topic_taxonomy("")
+                st.rerun()
+        with col_gap:
+            if st.button("Gap analysis global", key="sb_global_gap_btn", use_container_width=True):
+                with st.spinner("Analizez gap-urile globale..."):
+                    st.session_state[gaps_key] = apci_system.analyze_topic_gaps("")
+                st.rerun()
+        with col_clear:
+            if st.button("Curata", key="sb_global_analysis_clear", use_container_width=True):
+                for key in (synth_key, taxonomy_key, gaps_key):
+                    st.session_state.pop(key, None)
+                st.rerun()
+
+        _render_analysis_result("Sinteza globala", st.session_state.get(synth_key), "sinteza_globala")
+        _render_analysis_result("Taxonomie globala", st.session_state.get(taxonomy_key), "taxonomie_globala")
+        _render_analysis_result("Gap analysis global", st.session_state.get(gaps_key), "gap_analysis_global")
+
+
+def _render_analysis_result(label: str, data: Dict[str, Any] | None, filename_prefix: str) -> None:
+    if not data:
+        return
+    if data.get("error"):
+        st.warning(data["error"])
+        return
+    markdown = data.get("outline") or data.get("markdown") or ""
+    if not markdown:
+        st.info(f"{label}: rezultat gol.")
+        return
+    st.markdown(f"### {label}")
+    st.markdown(markdown)
+    sources = data.get("sources_used") or {}
+    if sources:
+        if isinstance(sources, dict) and all(isinstance(v, int) for v in sources.values()):
+            st.caption("Surse: " + " | ".join(f"{k}={v}" for k, v in sources.items()))
+    if data.get("citation_invalid"):
+        st.warning("Au fost eliminate citatii fara provenance: " + ", ".join(data["citation_invalid"]))
+
+    content = f"# {label}\n\n{markdown}\n"
+    col_save, col_dl = st.columns([1, 1])
+    with col_save:
+        if st.button(f"Salveaza {label.lower()}", key=f"sb_save_{filename_prefix}", use_container_width=True):
+            with st.spinner("Salvez si indexez analiza..."):
+                res = save_text_as_document(
+                    content=content,
+                    title=label,
+                    target_collection="general",
+                    description=f"{label} auto-generata din Second Brain",
+                    file_extension="md",
+                    filename_prefix=filename_prefix,
+                )
+            if res.get("success"):
+                st.success(res.get("message", "Salvat."))
+                st.rerun()
+            else:
+                st.error(res.get("message", "Salvare esuata."))
+    with col_dl:
+        st.download_button(
+            f"Descarca {label.lower()}",
+            data=content,
+            file_name=f"{filename_prefix}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key=f"sb_dl_{filename_prefix}",
+        )
 
 
 def _render_memory_surfacing(apci_system) -> None:

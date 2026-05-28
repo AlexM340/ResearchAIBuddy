@@ -471,6 +471,20 @@ def _render_status_section() -> None:
     st.caption(f"Postgres + pgvector: {'conectat' if postgres_ok else 'indisponibil (local fallback)'}")
     st.caption(f"Neo4j (graph): {'conectat' if neo4j_ok else 'indisponibil'}")
     st.caption(f"Tavily (web search): {'conectat' if web_search_ok else 'indisponibil (TAVILY_API_KEY lipsa)'}")
+    if postgres_ok and apci_system:
+        try:
+            storage_status = apci_system.get_storage_index_status() or {}
+            migrations = storage_status.get("migrations", {}) or {}
+            pending = migrations.get("pending") or []
+            if pending:
+                st.warning(f"Migratii DB pending: {len(pending)}")
+            counts = storage_status.get("memory_artifact_counts", {}) or {}
+            if counts:
+                st.caption(f"Memory artifacts: {sum(int(v or 0) for v in counts.values())}")
+        except Exception:
+            pass
+    if not postgres_ok:
+        st.warning("Mod limitat: Second Brain complet necesita Postgres + pgvector.")
 
     indexed_docs = int(summary.get("indexed_documents", 0) or 0)
     indexed_chunks = int(summary.get("indexed_chunks", 0) or 0)
@@ -602,6 +616,48 @@ def _render_advanced_section() -> None:
                     st.success("Setare actualizata.")
                 except Exception:
                     st.error("Nu am putut actualiza setarea.")
+
+        st.divider()
+        st.markdown("**Memorie canonica**")
+        try:
+            storage_status = apci_system.get_storage_index_status() or {}
+            migrations = storage_status.get("migrations", {}) or {}
+            pending_migrations = migrations.get("pending") or []
+            if pending_migrations:
+                st.warning("Migratii pending: " + ", ".join(pending_migrations))
+                if st.button("Aplica migratiile DB", use_container_width=True, key="sidebar_run_migrations"):
+                    repo = getattr(apci_system, "repository", None)
+                    ok = bool(repo and hasattr(repo.client, "run_migrations") and repo.client.run_migrations())
+                    if ok:
+                        st.success("Migratii aplicate.")
+                    else:
+                        st.error("Migratiile nu au putut fi aplicate.")
+                    st.rerun()
+            else:
+                st.caption("Schema DB: la zi.")
+        except Exception:
+            pass
+
+        if st.button("Backfill memory artifacts", use_container_width=True, key="sidebar_backfill_memory"):
+            with st.spinner("Construiesc memory_artifacts pentru date existente..."):
+                result = apci_system.backfill_memory_artifacts(limit=1000)
+            if result.get("success"):
+                st.success(f"Backfill: {result.get('created', 0)} artifact-uri create.")
+            else:
+                st.warning(f"Backfill partial: {result}")
+            st.rerun()
+
+        if st.button("Reconstruieste Neo4j din Postgres", use_container_width=True, key="sidebar_rebuild_graph"):
+            with st.spinner("Reconstruiesc proiectia Neo4j..."):
+                result = apci_system.rebuild_graph_projection()
+            if result.get("error"):
+                st.warning(result["error"])
+            else:
+                st.success(
+                    f"Graph rebuild: {result.get('chunks', 0)} chunks, "
+                    f"{result.get('artifacts', 0)} artifacts, {result.get('relations', 0)} relatii."
+                )
+            st.rerun()
 
         # Reindexare manuala (disponibila oricand — util dupa schimbari de model/schema)
         st.divider()

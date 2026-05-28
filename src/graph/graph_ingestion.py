@@ -272,6 +272,135 @@ class GraphIngestionService:
 
         return concepts, relations
 
+    def ingest_memory_artifacts(self, artifacts: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Project canonical Postgres memory artifacts into Neo4j."""
+        if not self.enabled:
+            return {"artifacts": 0, "concepts": 0, "relations": 0}
+
+        artifacts_count = 0
+        concepts_count = 0
+        relations_count = 0
+
+        for artifact in artifacts:
+            artifact_id = str(artifact.get("id") or "")
+            if not artifact_id:
+                continue
+            artifact_type = artifact.get("artifact_type", "memory")
+            title = artifact.get("title", "")
+            content = artifact.get("content", "")
+            collection = artifact.get("topic_collection", "") or "general"
+            topic_id = f"topic:{collection.lower()}"
+
+            self.client.run_write(
+                """
+                MERGE (t:Topic {id: $topic_id})
+                SET t.name = $topic_name
+                MERGE (a:Artifact {id: $artifact_id})
+                SET a.type = $artifact_type,
+                    a.title = $title,
+                    a.source_table = $source_table,
+                    a.source_id = $source_id,
+                    a.content = $content
+                MERGE (a)-[:ABOUT_TOPIC]->(t)
+                """,
+                {
+                    "topic_id": topic_id,
+                    "topic_name": collection,
+                    "artifact_id": artifact_id,
+                    "artifact_type": artifact_type,
+                    "title": title,
+                    "source_table": artifact.get("source_table", ""),
+                    "source_id": str(artifact.get("source_id", "")),
+                    "content": content[:3000],
+                },
+            )
+            artifacts_count += 1
+
+            concepts, relations = self._extract_graph_payload(content or title)
+            for concept, confidence in concepts:
+                if confidence < self.min_confidence:
+                    continue
+                self.client.run_write(
+                    """
+                    MERGE (k:Concept {name: $concept})
+                    MERGE (a:Artifact {id: $artifact_id})
+                    MERGE (t:Topic {id: $topic_id})
+                    MERGE (a)-[r:MENTIONS]->(k)
+                    SET r.confidence = $confidence
+                    MERGE (k)-[:RELATED_TO]->(t)
+                    """,
+                    {
+                        "concept": concept,
+                        "artifact_id": artifact_id,
+                        "topic_id": topic_id,
+                        "confidence": float(confidence),
+                    },
+                )
+                concepts_count += 1
+
+            for relation in relations:
+                relation_type = relation.get("type", "RELATED_TO")
+                confidence = float(relation.get("confidence", 0.0))
+                if relation_type not in ALLOWED_RELATIONS or confidence < self.min_confidence:
+                    continue
+                self.client.run_write(
+                    f"""
+                    MERGE (a:Concept {{name: $source}})
+                    MERGE (b:Concept {{name: $target}})
+                    MERGE (a)-[r:{relation_type}]->(b)
+                    SET r.confidence = $confidence,
+                        r.artifact_id = $artifact_id,
+                        r.topic = $topic
+                    """,
+                    {
+                        "source": relation["source"],
+                        "target": relation["target"],
+                        "confidence": confidence,
+                        "artifact_id": artifact_id,
+                        "topic": collection,
+                    },
+                )
+                relations_count += 1
+
+        return {
+            "artifacts": artifacts_count,
+            "concepts": concepts_count,
+            "relations": relations_count,
+        }
+
+    def rebuild_projection(
+        self,
+        chunks: Optional[List[Dict[str, Any]]] = None,
+        memory_artifacts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, int]:
+        """Delete derived Neo4j projection and rebuild it from Postgres data."""
+        if not self.enabled:
+            return {
+                "deleted": 0,
+                "documents": 0,
+                "chunks": 0,
+                "artifacts": 0,
+                "concepts": 0,
+                "relations": 0,
+            }
+
+        delete_result = self.client.run_read(
+            "MATCH (n) WITH count(n) AS count DETACH DELETE n RETURN count",
+            {},
+        )
+        deleted = int(delete_result[0].get("count", 0)) if delete_result else 0
+
+        chunk_result = self.ingest_chunks(chunks or [])
+        artifact_result = self.ingest_memory_artifacts(memory_artifacts or [])
+        return {
+            "deleted": deleted,
+            "documents": int(chunk_result.get("documents", 0)),
+            "chunks": int(chunk_result.get("chunks", 0)),
+            "artifacts": int(artifact_result.get("artifacts", 0)),
+            "concepts": int(chunk_result.get("concepts", 0)) + int(artifact_result.get("concepts", 0)),
+            "relations": int(chunk_result.get("relations", 0)) + int(artifact_result.get("relations", 0)),
+        }
+
     def ingest_decision(
         self,
         decision_id: str,

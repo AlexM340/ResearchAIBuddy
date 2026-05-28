@@ -14,7 +14,7 @@ import streamlit as st
 from views._shared import system_ready
 
 
-ROUTE_OPTIONS = ["Toate", "vector", "hybrid", "external"]
+ROUTE_OPTIONS = ["Toate", "vector", "memory", "hybrid", "external", "synthesis"]
 
 
 def render_retrieval_logs() -> None:
@@ -126,9 +126,16 @@ def _render_logs_table(apci_system) -> None:
                 "route": log.get("route_used", ""),
                 "latency_ms": round(float(log.get("latency_ms") or 0.0), 1),
                 "question": (log.get("question") or "")[:120],
-                "vector_hits": metrics.get("vector_count", metrics.get("vector_hits", "")),
-                "graph_hits": metrics.get("graph_count", metrics.get("graph_hits", "")),
+                "vector_hits": metrics.get("vector_hits", ""),
+                "memory_hits": metrics.get("memory_hits", ""),
+                "note_hits": metrics.get("note_hits", ""),
+                "graph_hits": metrics.get("graph_hits", ""),
+                "web": metrics.get("used_web", ""),
+                "hyde": metrics.get("used_hyde", ""),
+                "rerank": metrics.get("used_reranker", ""),
+                "bad_citations": ", ".join(metrics.get("citation_invalid", []) or []),
                 "answer_origin": metrics.get("answer_origin", ""),
+                "error": metrics.get("error", ""),
             }
         )
 

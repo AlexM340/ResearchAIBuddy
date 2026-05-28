@@ -10,10 +10,17 @@ class DummyNeo4jClient:
     def __init__(self) -> None:
         self.enabled = True
         self.writes = []
+        self.reads = []
 
     def run_write(self, cypher, parameters=None):
         self.writes.append((cypher, parameters or {}))
         return True
+
+    def run_read(self, cypher, parameters=None):
+        self.reads.append((cypher, parameters or {}))
+        if "DETACH DELETE" in cypher:
+            return [{"count": 0}]
+        return []
 
 
 def test_graph_ingestion_structured_mode_applies_confidence_gating():
@@ -121,3 +128,77 @@ def test_memory_consolidation_promotes_episode_to_semantic():
     assert len(persisted) == 1
     assert persisted[0]["memory_type"] == "semantic"
     assert persisted[0]["source"] == "memory_consolidation"
+
+
+def test_citation_validator_strips_unbacked_citations():
+    apci = _build_test_apci()
+    validation = apci._validate_citations(
+        "Raspuns valid [D1] dar citatia asta nu exista [N9].",
+        {"D1": {"kind": "document"}},
+    )
+
+    assert "[D1]" in validation["response"]
+    assert "[N9]" not in validation["response"]
+    assert validation["invalid"] == ["N9"]
+    assert validation["used"] == ["D1"]
+
+
+def test_medium_confidence_task_becomes_persistent_proposal():
+    apci = _build_test_apci()
+
+    class DummyRepository:
+        enabled = True
+
+        def __init__(self):
+            self.created = []
+
+        def create_memory_proposal(self, proposal_type, payload, confidence, topic_collection):
+            self.created.append((proposal_type, payload, confidence, topic_collection))
+            return 42
+
+    repo = DummyRepository()
+    apci.repository = repo
+    persisted = []
+    apci._persist_tasks = MethodType(lambda self, tasks: persisted.extend(tasks), apci)
+
+    outcome = apci._process_memory_candidates(
+        "task",
+        [
+            {
+                "title": "citeste sursele noi",
+                "details": "detalii",
+                "topic_collection": "licenta",
+                "priority": "normal",
+                "confidence": 0.78,
+            }
+        ],
+    )
+
+    assert persisted == []
+    assert outcome["auto_saved"] == []
+    assert outcome["proposed"][0]["proposal_id"] == 42
+    assert repo.created[0][0] == "task"
+
+
+def test_topic_analysis_prompt_builds_typed_citation_map():
+    apci = _build_test_apci()
+    prompt, citation_map = apci._build_topic_analysis_prompt(
+        "taxonomy",
+        "licenta",
+        {
+            "doc_chunks": [{"content": "GraphRAG combina vectori si graf.", "metadata": {"filename": "paper.md"}}],
+            "notes": [{"id": 7, "title": "Idee", "content": "Prefer explicatii scurte."}],
+            "decisions": [{"id": 3, "title": "Ruta hybrid", "rationale": "Folosim hybrid pentru relatii."}],
+            "preferences": [{"id": 2, "preference_key": "language", "preference_value": "romana"}],
+            "memory_artifacts": [{"id": 9, "artifact_type": "task", "title": "Task", "content": "Verifica logs."}],
+            "graph_items": [{"source": "GraphRAG", "target": "Retrieval", "type": "RELATED_TO"}],
+        },
+    )
+
+    assert "[D1]" in prompt
+    assert "[N1]" in prompt
+    assert "[Dec1]" in prompt
+    assert "[P1]" in prompt
+    assert "[M1]" in prompt
+    assert "[G1]" in prompt
+    assert set(citation_map) == {"D1", "N1", "Dec1", "P1", "M1", "G1"}

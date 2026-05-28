@@ -178,6 +178,7 @@ def _render_open_notebook(notebook_name: str) -> None:
             st.rerun()
 
     _render_notebook_synthesis(notebook_name)
+    _render_notebook_analysis(notebook_name)
 
     sources_col, chat_col = st.columns([1, 2])
 
@@ -293,6 +294,94 @@ def _render_notebook_synthesis(notebook_name: str) -> None:
                 use_container_width=True,
                 key=f"nb_synth_dl_{notebook_name}",
             )
+
+
+def _render_notebook_analysis(notebook_name: str) -> None:
+    """Taxonomie si gap analysis pentru notebook."""
+    apci_system = st.session_state.get("apci_system")
+    if not apci_system:
+        return
+
+    taxonomy_key = f"nb_taxonomy_data_{notebook_name}"
+    gaps_key = f"nb_gaps_data_{notebook_name}"
+
+    with st.expander(f"Taxonomie si gap analysis pentru '{notebook_name}'", expanded=False):
+        col_tax, col_gap, col_clear = st.columns([1, 1, 1])
+        with col_tax:
+            if st.button("Genereaza taxonomie", key=f"nb_tax_gen_{notebook_name}", use_container_width=True):
+                if not hasattr(apci_system, "analyze_topic_taxonomy"):
+                    st.error("Taxonomia nu este disponibila in backend.")
+                else:
+                    with st.spinner("Construiesc taxonomia..."):
+                        st.session_state[taxonomy_key] = apci_system.analyze_topic_taxonomy(notebook_name)
+                    st.rerun()
+        with col_gap:
+            if st.button("Genereaza gap analysis", key=f"nb_gap_gen_{notebook_name}", use_container_width=True):
+                if not hasattr(apci_system, "analyze_topic_gaps"):
+                    st.error("Gap analysis nu este disponibil in backend.")
+                else:
+                    with st.spinner("Analizez acoperirea si golurile..."):
+                        st.session_state[gaps_key] = apci_system.analyze_topic_gaps(notebook_name)
+                    st.rerun()
+        with col_clear:
+            if st.button("Curata analize", key=f"nb_analysis_clear_{notebook_name}", use_container_width=True):
+                st.session_state.pop(taxonomy_key, None)
+                st.session_state.pop(gaps_key, None)
+                st.rerun()
+
+        for label, state_key, prefix in (
+            ("Taxonomie", taxonomy_key, "taxonomie"),
+            ("Gap analysis", gaps_key, "gap_analysis"),
+        ):
+            data = st.session_state.get(state_key)
+            if not data:
+                continue
+            if data.get("error"):
+                st.warning(data["error"])
+                continue
+            markdown = data.get("markdown", "")
+            if not markdown:
+                st.info(f"{label}: rezultat gol.")
+                continue
+            st.markdown(f"### {label}")
+            st.markdown(markdown)
+            sources = data.get("sources_used") or {}
+            if sources:
+                st.caption("Surse: " + " | ".join(f"{k}={v}" for k, v in sources.items()))
+            if data.get("citation_invalid"):
+                st.warning("Au fost eliminate citatii fara provenance: " + ", ".join(data["citation_invalid"]))
+
+            content = f"# {label}: {notebook_name}\n\n{markdown}\n"
+            col_save, col_dl = st.columns([1, 1])
+            with col_save:
+                if st.button(
+                    f"Salveaza {label.lower()} ca document",
+                    key=f"nb_{prefix}_save_{notebook_name}",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Salvez si indexez analiza..."):
+                        res = save_text_as_document(
+                            content=content,
+                            title=f"{label} {notebook_name}",
+                            target_collection=notebook_name,
+                            description=f"{label} auto-generata din Second Brain",
+                            file_extension="md",
+                            filename_prefix=prefix,
+                        )
+                    if res.get("success"):
+                        st.success(res.get("message", "Salvat."))
+                        st.rerun()
+                    else:
+                        st.error(res.get("message", "Salvare esuata."))
+            with col_dl:
+                st.download_button(
+                    f"Descarca {label.lower()}",
+                    data=content,
+                    file_name=f"{prefix}_{notebook_name}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    key=f"nb_{prefix}_dl_{notebook_name}",
+                )
 
 
 _SORT_OPTIONS = ["Nume", "Data adaugarii", "Marime", "Tip"]

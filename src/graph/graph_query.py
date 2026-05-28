@@ -42,14 +42,18 @@ class GraphQueryService:
         WHERE ALL(rel IN relationships(p) WHERE coalesce(rel.confidence, 0.0) >= $min_confidence)
         OPTIONAL MATCH (ch:Chunk)-[m:MENTIONS]->(linked)
         OPTIONAL MATCH (ch)-[:SOURCED_FROM]->(d:Document)-[:ABOUT_TOPIC]->(t:Topic)
-        WHERE ($topic = '' OR toLower(t.name) = toLower($topic))
+        OPTIONAL MATCH (art:Artifact)-[:MENTIONS]->(linked)
+        OPTIONAL MATCH (art)-[:ABOUT_TOPIC]->(at:Topic)
+        WHERE ($topic = '' OR toLower(coalesce(t.name, at.name, '')) = toLower($topic))
         RETURN seed.name AS seed_concept,
                linked.name AS concept,
                ch.id AS chunk_id,
-               substring(ch.text, 0, 700) AS chunk_text,
-               d.id AS document_id,
-               d.filename AS filename,
-               coalesce(t.name, $topic) AS topic,
+               substring(coalesce(ch.text, art.content, ''), 0, 700) AS chunk_text,
+               coalesce(d.id, art.source_id, art.id) AS document_id,
+               coalesce(d.filename, art.title, '') AS filename,
+               coalesce(t.name, at.name, $topic) AS topic,
+               art.id AS artifact_id,
+               art.type AS artifact_type,
                [rel IN relationships(p) | type(rel)] AS relation_types,
                [rel IN relationships(p) | coalesce(rel.confidence, 0.0)] AS relation_scores,
                length(p) AS hops
@@ -85,6 +89,8 @@ class GraphQueryService:
                     "content": row.get("chunk_text", ""),
                     "document_id": row.get("document_id", ""),
                     "filename": row.get("filename", ""),
+                    "artifact_id": row.get("artifact_id", ""),
+                    "artifact_type": row.get("artifact_type", ""),
                     "collection": row.get("topic", active_collection or ""),
                     "relation_types": relation_types,
                     "hops": hops,
