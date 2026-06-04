@@ -282,6 +282,99 @@ class SimpleCache:
         self.cache.clear()
         self.stats = {"hits": 0, "misses": 0, "total_saved_tokens": 0}
 
+class ResponseCache:
+    """Unified response cache adapter for diskcache and in-memory fallback."""
+
+    def __init__(self, cache_dir: str = "./data/cache/responses_cache", max_size: int = 1000):
+        self.backend_type = "memory"
+        self.stats = {"hits": 0, "misses": 0, "total_saved_tokens": 0}
+        self._memory = SimpleCache(max_size=max_size)
+        self._disk = None
+
+        if DISKCACHE_AVAILABLE:
+            try:
+                cache_path = Path(cache_dir)
+                cache_path.mkdir(parents=True, exist_ok=True)
+                self._disk = Cache(str(cache_path))
+                self.backend_type = "diskcache"
+                logger.info("Response cache activ: diskcache (%s)", cache_path)
+            except Exception as exc:
+                logger.warning("Nu s-a putut initializa diskcache, fallback memory: %s", exc)
+                self._disk = None
+
+    @staticmethod
+    def _generate_key(prompt: str, model_settings: Dict[str, Any]) -> str:
+        content = f"{prompt}_{json.dumps(model_settings, sort_keys=True)}"
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def get_cached_response(self, prompt: str, model_settings: Dict[str, Any]) -> Optional[str]:
+        if self._disk is None:
+            return self._memory.get_cached_response(prompt, model_settings)
+
+        key = self._generate_key(prompt, model_settings)
+        try:
+            record = self._disk.get(key)
+            if isinstance(record, dict) and "response" in record:
+                response = record.get("response", "")
+                self.stats["hits"] += 1
+                self.stats["total_saved_tokens"] += len(response)
+                return response
+            self.stats["misses"] += 1
+            return None
+        except Exception as exc:
+            logger.warning("ResponseCache disk read failed: %s", exc)
+            return self._memory.get_cached_response(prompt, model_settings)
+
+    def cache_response(self, prompt: str, response: str, model_settings: Dict[str, Any]) -> None:
+        if len(response or "") < 50:
+            return
+        if self._disk is None:
+            self._memory.cache_response(prompt, response, model_settings)
+            return
+
+        key = self._generate_key(prompt, model_settings)
+        try:
+            self._disk.set(
+                key,
+                {
+                    "response": response,
+                    "timestamp": time.time(),
+                    "model_settings": model_settings,
+                },
+            )
+        except Exception as exc:
+            logger.warning("ResponseCache disk write failed: %s", exc)
+            self._memory.cache_response(prompt, response, model_settings)
+
+    def get_stats(self) -> Dict[str, Any]:
+        if self._disk is None:
+            stats = self._memory.get_stats()
+            stats["backend"] = "memory"
+            return stats
+
+        total_requests = self.stats["hits"] + self.stats["misses"]
+        hit_rate = (self.stats["hits"] / max(total_requests, 1)) * 100
+        try:
+            cache_size = len(self._disk)
+        except Exception:
+            cache_size = 0
+        return {
+            **self.stats,
+            "backend": self.backend_type,
+            "total_requests": total_requests,
+            "hit_rate_percent": hit_rate,
+            "cache_size": cache_size,
+        }
+
+    def clear_cache(self) -> None:
+        self.stats = {"hits": 0, "misses": 0, "total_saved_tokens": 0}
+        self._memory.clear_cache()
+        if self._disk is not None:
+            try:
+                self._disk.clear()
+            except Exception as exc:
+                logger.warning("ResponseCache disk clear failed: %s", exc)
+
 class PersistentEmbeddingsCache:
     """Cache persistent pentru embeddings cu verificare hash MD5 si tracking model."""
 
@@ -1229,19 +1322,8 @@ class CerebrumAISystem:
             requests_per_day=config.rate_limit_rpd
         )
         
-        # Încearcă să folosească cache avansat sau fallback
-        if DISKCACHE_AVAILABLE and config.cache_enabled:
-            try:
-                from diskcache import Cache
-                cache_dir = Path("./data/cache")
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                self.cache_manager = Cache(str(cache_dir / "responses_cache"))
-                logger.info("Cache avansat (diskcache) activat")
-            except Exception as e:
-                logger.warning(f"Nu s-a putut inițializa cache avansat: {e}")
-                self.cache_manager = SimpleCache() if config.cache_enabled else None
-        else:
-            self.cache_manager = SimpleCache() if config.cache_enabled else None
+        # Cache unificat: expune acelasi API peste diskcache sau fallback in-memory.
+        self.cache_manager = ResponseCache() if config.cache_enabled else None
         
         self.document_processor = SimpleDocumentProcessor(config)
         self.retriever = SimpleRetriever(config)
@@ -1517,6 +1599,16 @@ class CerebrumAISystem:
             return base_status
 
         index_status = self.repository.get_index_status()
+        migration_status = (
+            self.repository.get_migration_status()
+            if hasattr(self.repository, "get_migration_status")
+            else {"applied": [], "pending": [], "error": None}
+        )
+        artifact_counts = (
+            self.repository.get_memory_artifact_counts()
+            if hasattr(self.repository, "get_memory_artifact_counts")
+            else {}
+        )
         return {
             "storage_mode": "db_primary",
             "postgres_enabled": True,
@@ -1524,6 +1616,8 @@ class CerebrumAISystem:
             "indexed_chunks": int(index_status.get("indexed_chunks", 0) or 0),
             "last_sync_at": index_status.get("last_sync_at"),
             "db_primary_strict": bool(self.config.db_primary_strict),
+            "migrations": migration_status,
+            "memory_artifact_counts": artifact_counts,
         }
     
     def load_documents_legacy(self, file_paths: List[str]) -> bool:
@@ -1872,9 +1966,11 @@ RĂSPUNS:"""
         graph_paths: List[Dict[str, Any]],
         memory_hits: Optional[List[Dict[str, Any]]] = None,
         note_hits: Optional[List[Dict[str, Any]]] = None,
+        memory_artifacts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         memory_hits = memory_hits or []
         note_hits = note_hits or []
+        memory_artifacts = memory_artifacts or []
 
         memory_lines: List[str] = []
         memory_provenance: List[Dict[str, Any]] = []
@@ -1913,6 +2009,25 @@ RĂSPUNS:"""
                 }
             )
 
+        artifact_lines: List[str] = []
+        artifact_provenance: List[Dict[str, Any]] = []
+        for artifact in memory_artifacts[:6]:
+            citation = artifact.get("citation") or "M"
+            artifact_type = artifact.get("artifact_type", artifact.get("memory_type", "memory"))
+            title = artifact.get("title") or f"Memorie {citation}"
+            content = artifact.get("content") or artifact.get("rationale", "")
+            topic = artifact.get("topic_collection", "") or "global"
+            preview = content[:450] + "..." if len(content) > 450 else content
+            artifact_lines.append(f"[{citation}] [{artifact_type}] {title} ({topic}) -> {preview}")
+            artifact_provenance.append(
+                {
+                    "citation": citation,
+                    "kind": artifact_type,
+                    "score": float(artifact.get("similarity", artifact.get("confidence", 0.0)) or 0.0),
+                    "source": artifact,
+                }
+            )
+
         if (
             self.context_builder is None
             or self.hybrid_fusion is None
@@ -1931,13 +2046,20 @@ RĂSPUNS:"""
                     + "\n".join(note_lines)
                     + "\nFolosește citări [N#] când utilizezi notele tale."
                 )
+            if artifact_lines:
+                prompt += (
+                    "\n\nMEMORIE INDEXATA TIPIZATA:\n"
+                    + "\n".join(artifact_lines)
+                    + "\nFoloseste citari tipizate [N#], [Dec#], [P#], [T#], [Ep#] cand utilizezi aceste surse."
+                )
             return {
                 "prompt": prompt,
-                "provenance": memory_provenance + note_provenance,
+                "provenance": memory_provenance + note_provenance + artifact_provenance,
                 "vector_sources": [doc.get("metadata", {}) for doc in vector_docs[: self.config.max_context_docs]],
                 "graph_sources": [],
                 "memory_sources": memory_hits[:3],
                 "note_sources": note_hits[:3],
+                "memory_artifacts": memory_artifacts[:6],
                 "selected_vector_docs": vector_docs[: self.config.max_context_docs],
             }
 
@@ -1972,8 +2094,17 @@ RĂSPUNS:"""
                 + "\nFolosește citări [N#] când utilizezi notele tale."
             )
             built["provenance"].extend(note_provenance)
+        if artifact_lines:
+            built["prompt"] = (
+                built.get("prompt", "")
+                + "\n\nMEMORIE INDEXATA TIPIZATA:\n"
+                + "\n".join(artifact_lines)
+                + "\nFoloseste citari tipizate [N#], [Dec#], [P#], [T#], [Ep#] cand utilizezi aceste surse."
+            )
+            built["provenance"].extend(artifact_provenance)
         built["memory_sources"] = memory_hits[:3]
         built["note_sources"] = note_hits[:3]
+        built["memory_artifacts"] = memory_artifacts[:6]
 
         selected_vector_docs = []
         for item in evidence_items:
@@ -2188,12 +2319,40 @@ RĂSPUNS:"""
                     matched.update(preference)
 
             if self.repository and self.repository.enabled:
-                self.repository.upsert_preference(
+                pref_id = self.repository.upsert_preference(
                     preference_key=preference.get("preference_key", ""),
                     preference_value=preference.get("preference_value", ""),
                     topic_collection=preference.get("topic_collection", ""),
                     confidence=float(preference.get("confidence", 0.8)),
                 )
+                if pref_id:
+                    title = f"Preferinta: {preference.get('preference_key', '')}"
+                    content = preference.get("preference_value", "")
+                    artifact_id = self._upsert_memory_artifact(
+                        artifact_type="preference",
+                        source_table="preferences",
+                        source_id=pref_id,
+                        title=title,
+                        content=content,
+                        topic_collection=preference.get("topic_collection", ""),
+                        confidence=float(preference.get("confidence", 0.8)),
+                        metadata={
+                            "preference_id": pref_id,
+                            "preference_key": preference.get("preference_key", ""),
+                        },
+                    )
+                    self._record_memory_event(
+                        event_type="preference_updated",
+                        artifact_type="preference",
+                        artifact_id=artifact_id,
+                        topic_collection=preference.get("topic_collection", ""),
+                        title=title,
+                        preview=content[:250],
+                        metadata={
+                            "preference_id": pref_id,
+                            "preference_key": preference.get("preference_key", ""),
+                        },
+                    )
 
     # Markeri care indica intent CLAR de capturare nota ("noteaza asta", "vreau sa retin").
     _NOTE_EXPLICIT_MARKERS = (
@@ -2326,13 +2485,110 @@ RĂSPUNS:"""
                         "confidence": conf,
                     })
             elif conf >= 0.50:
-                result["proposed"].append({
+                proposal = {
                     "title": cand.get("title", ""),
                     "content": cand.get("content", ""),
                     "topic_collection": cand.get("topic_collection", "") or "",
                     "confidence": conf,
-                })
+                }
+                if self.repository and self.repository.enabled:
+                    proposal_id = self.repository.create_memory_proposal(
+                        proposal_type="note",
+                        payload=proposal,
+                        confidence=conf,
+                        topic_collection=proposal["topic_collection"],
+                    )
+                    if proposal_id:
+                        proposal["proposal_id"] = proposal_id
+                result["proposed"].append(proposal)
         return result
+
+    def _process_memory_candidates(
+        self,
+        proposal_type: str,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Apply HIGH/MEDIUM/LOW confidence tiers for non-note memory candidates.
+
+        HIGH (>=0.85) is persisted immediately. MEDIUM (0.50-0.84) becomes a
+        persistent proposal when Postgres is available, and is still returned
+        to the UI for inline confirmation.
+        """
+        result = {"auto_saved": [], "proposed": []}
+        clean_type = (proposal_type or "").strip().lower()
+        if clean_type not in {"task", "decision", "preference"}:
+            return result
+
+        for cand in candidates or []:
+            conf = float(cand.get("confidence", 0.0) or 0.0)
+            payload = self._proposal_payload(clean_type, cand, conf)
+            if not payload:
+                continue
+
+            if conf >= 0.85:
+                if clean_type == "task":
+                    self._persist_tasks([cand])
+                elif clean_type == "decision":
+                    self._persist_decision(cand)
+                elif clean_type == "preference":
+                    self._persist_preferences([cand])
+                result["auto_saved"].append(payload)
+            elif conf >= 0.50:
+                if self.repository and self.repository.enabled and hasattr(self.repository, "create_memory_proposal"):
+                    proposal_id = self.repository.create_memory_proposal(
+                        proposal_type=clean_type,
+                        payload=payload,
+                        confidence=conf,
+                        topic_collection=payload.get("topic_collection", "") or "",
+                    )
+                    if proposal_id:
+                        payload["proposal_id"] = proposal_id
+                result["proposed"].append(payload)
+
+        return result
+
+    @staticmethod
+    def _proposal_payload(
+        proposal_type: str,
+        candidate: Dict[str, Any],
+        confidence: float,
+    ) -> Dict[str, Any]:
+        topic = candidate.get("topic_collection", "") or ""
+        if proposal_type == "task":
+            title = (candidate.get("title") or "").strip()
+            if not title:
+                return {}
+            return {
+                "title": title,
+                "details": candidate.get("details", "") or "",
+                "topic_collection": topic,
+                "priority": candidate.get("priority", "normal") or "normal",
+                "due_at": candidate.get("due_at"),
+                "confidence": confidence,
+            }
+        if proposal_type == "decision":
+            title = (candidate.get("title") or "").strip()
+            rationale = (candidate.get("rationale") or candidate.get("content") or "").strip()
+            if not title or not rationale:
+                return {}
+            return {
+                "title": title,
+                "rationale": rationale,
+                "topic_collection": topic,
+                "confidence": confidence,
+            }
+        if proposal_type == "preference":
+            key = (candidate.get("preference_key") or "").strip()
+            value = (candidate.get("preference_value") or candidate.get("content") or "").strip()
+            if not key or not value:
+                return {}
+            return {
+                "preference_key": key,
+                "preference_value": value,
+                "topic_collection": topic,
+                "confidence": confidence,
+            }
+        return {}
 
     def _extract_task_candidates(
         self,
@@ -2420,7 +2676,7 @@ RĂSPUNS:"""
                 existing_ids.add(task_id)
 
             if self.repository and self.repository.enabled:
-                self.repository.create_task(
+                created_id = self.repository.create_task(
                     title=task.get("title", ""),
                     details=task.get("details", ""),
                     topic_collection=task.get("topic_collection", ""),
@@ -2428,6 +2684,33 @@ RĂSPUNS:"""
                     priority=task.get("priority", "normal"),
                     confidence=float(task.get("confidence", 0.7) or 0.7),
                 )
+                if created_id:
+                    content = (
+                        f"{task.get('title', '')}\n\n"
+                        f"{task.get('details', '')}\n"
+                        f"Status: {task.get('status', 'open')}; "
+                        f"Prioritate: {task.get('priority', 'normal')}"
+                    ).strip()
+                    artifact_id = self._upsert_memory_artifact(
+                        artifact_type="task",
+                        source_table="tasks",
+                        source_id=created_id,
+                        title=task.get("title", ""),
+                        content=content,
+                        topic_collection=task.get("topic_collection", ""),
+                        confidence=float(task.get("confidence", 0.7) or 0.7),
+                        status=task.get("status", "open"),
+                        metadata={"task_id": created_id, "priority": task.get("priority", "normal")},
+                    )
+                    self._record_memory_event(
+                        event_type="task_created",
+                        artifact_type="task",
+                        artifact_id=artifact_id,
+                        topic_collection=task.get("topic_collection", ""),
+                        title=task.get("title", ""),
+                        preview=task.get("details", "")[:250],
+                        metadata={"task_id": created_id, "priority": task.get("priority", "normal")},
+                    )
 
     def list_tasks(
         self,
@@ -2574,6 +2857,29 @@ RĂSPUNS:"""
         if len(self.local_episodes) > 200:
             self.local_episodes = self.local_episodes[-200:]
 
+        if self.repository and self.repository.enabled:
+            title = question_clean[:140]
+            content = f"Intrebare: {question_clean}\n\nRaspuns: {response_clean[:1200]}"
+            artifact_id = self._upsert_memory_artifact(
+                artifact_type="episode",
+                source_table="messages",
+                source_id=f"episode_{episode_id}",
+                title=title,
+                content=content,
+                topic_collection=active_collection or "",
+                confidence=0.6,
+                metadata={"question": question_clean, "source": "chat_episode"},
+            )
+            self._record_memory_event(
+                event_type="episode_captured",
+                artifact_type="episode",
+                artifact_id=artifact_id,
+                topic_collection=active_collection or "",
+                title=title,
+                preview=response_clean[:250],
+                metadata={"episode_id": f"episode_{episode_id}"},
+            )
+
     def _persist_decision(self, decision: Dict[str, Any]) -> None:
         if not decision:
             return
@@ -2588,18 +2894,39 @@ RĂSPUNS:"""
             self.local_decisions.append(decision)
 
         # Persist to Postgres if available.
+        saved_id = None
         if self.repository and self.repository.enabled:
-            self.repository.save_decision(
+            saved_id = self.repository.save_decision(
                 title=decision.get("title", ""),
                 rationale=decision.get("rationale", ""),
                 topic_collection=decision.get("topic_collection", ""),
                 confidence=float(decision.get("confidence", 0.75)),
             )
+            if saved_id:
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="decision",
+                    source_table="decisions",
+                    source_id=saved_id,
+                    title=decision.get("title", ""),
+                    content=decision.get("rationale", ""),
+                    topic_collection=decision.get("topic_collection", ""),
+                    confidence=float(decision.get("confidence", 0.75)),
+                    metadata={"decision_id": saved_id, "source": decision.get("source", "decision")},
+                )
+                self._record_memory_event(
+                    event_type="decision",
+                    artifact_type="decision",
+                    artifact_id=artifact_id,
+                    topic_collection=decision.get("topic_collection", ""),
+                    title=decision.get("title", ""),
+                    preview=decision.get("rationale", "")[:250],
+                    metadata={"decision_id": saved_id, "confidence": decision.get("confidence", 0.75)},
+                )
 
         # Mirror decision into graph if available.
         if self.graph_ingestion and self.graph_ingestion.enabled:
             self.graph_ingestion.ingest_decision(
-                decision_id=decision.get("id", ""),
+                decision_id=str(saved_id or decision.get("id", "")),
                 title=decision.get("title", ""),
                 rationale=decision.get("rationale", ""),
                 topic_collection=decision.get("topic_collection", ""),
@@ -2677,7 +3004,7 @@ INSTRUCȚIUNI:
             snippet = source.get("snippet", "")
             snippet_preview = snippet[:600] + "..." if len(snippet) > 600 else snippet
             source_blocks.append(
-                f"[E{idx}] {title}\nURL: {url}\nRezumat: {snippet_preview}"
+                f"[W{idx}] {title}\nURL: {url}\nRezumat: {snippet_preview}"
             )
 
         sources_text = "\n\n".join(source_blocks)
@@ -2690,7 +3017,7 @@ SURSE EXTERNE:
 
 INSTRUCȚIUNI:
 - Răspunde strict pe baza surselor externe de mai sus.
-- Marchează citările cu formatul [E1], [E2], etc.
+- Marchează citările cu formatul [W1], [W2], etc.
 - Dacă sursele externe sunt insuficiente, spune explicit acest lucru.
 - Formulează răspunsul în română, max 4 paragrafe.
 """
@@ -2710,6 +3037,26 @@ INSTRUCȚIUNI:
         # Daca web fallback dezactivat si nu suntem fortati explicit, returneaza un raspuns minimal.
         if not force and not self.config.enable_web_fallback:
             response_time = time.time() - start_time
+            disabled_metrics = {
+                "answer_origin": "external_disabled",
+                "vector_hits": 0,
+                "memory_hits": len(memory_hits or []),
+                "note_hits": 0,
+                "graph_hits": 0,
+                "external_sources": 0,
+                "used_web": False,
+                "used_hyde": bool(self.config.enable_hyde),
+                "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                "cached": False,
+                "error": "web_fallback_disabled",
+            }
+            if self.repository and self.repository.enabled:
+                self.repository.log_retrieval(
+                    question=question,
+                    route_used=route_used,
+                    latency_ms=response_time * 1000.0,
+                    metrics={**disabled_metrics, "fallback_reason": reason},
+                )
             return {
                 "response": (
                     "Nu am suficient context intern pentru aceasta intrebare si "
@@ -2721,6 +3068,10 @@ INSTRUCȚIUNI:
                 "memory_hits": memory_hits or [],
                 "tasks": [],
                 "provenance": [],
+                "citation_map": {},
+                "retrieval_metrics": {
+                    **disabled_metrics,
+                },
                 "external_sources": [],
                 "cached": False,
                 "response_time": response_time,
@@ -2740,6 +3091,12 @@ INSTRUCȚIUNI:
         self.rate_limiter.add_request()
         external_response = self.llm.generate(external_prompt)
         self.stats["llm_calls"] += 1
+        external_citation_map = {
+            f"W{idx}": source
+            for idx, source in enumerate(external_sources, 1)
+        }
+        citation_validation = self._validate_citations(external_response, external_citation_map)
+        external_response = citation_validation["response"]
 
         response_time = time.time() - start_time
         self._update_avg_response_time(response_time)
@@ -2750,9 +3107,20 @@ INSTRUCȚIUNI:
                 route_used=route_used,
                 latency_ms=response_time * 1000.0,
                 metrics={
+                    "answer_origin": "external",
+                    "vector_hits": 0,
+                    "note_hits": 0,
+                    "graph_hits": 0,
+                    "used_web": True,
+                    "used_hyde": bool(self.config.enable_hyde),
+                    "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                    "cached": False,
+                    "error": None,
                     "fallback_reason": reason,
                     "external_sources": len(external_sources),
                     "memory_hits": len(memory_hits or []),
+                    "citation_invalid": citation_validation["invalid"],
+                    "citation_used": citation_validation["used"],
                 },
             )
 
@@ -2760,8 +3128,17 @@ INSTRUCȚIUNI:
             question=question,
             active_collection=active_collection,
         )
-        if preference_candidates:
-            self._persist_preferences(preference_candidates)
+        preference_outcome = self._process_memory_candidates("preference", preference_candidates)
+
+        decision_candidate = self._extract_decision_candidate(
+            question=question,
+            response=external_response,
+            active_collection=active_collection,
+        )
+        decision_outcome = self._process_memory_candidates(
+            "decision",
+            [decision_candidate] if decision_candidate else [],
+        )
 
         self._capture_episode(
             question=question,
@@ -2774,8 +3151,14 @@ INSTRUCȚIUNI:
             response=external_response,
             active_collection=active_collection,
         )
-        if task_candidates:
-            self._persist_tasks(task_candidates)
+        task_outcome = self._process_memory_candidates("task", task_candidates)
+
+        note_candidates = self._extract_note_candidates(
+            question=question,
+            response=external_response,
+            active_collection=active_collection,
+        )
+        note_outcome = self._process_note_candidates(note_candidates)
 
         self._run_memory_consolidation(active_collection=active_collection)
         tasks_snapshot = self.list_tasks(active_collection=active_collection, limit=20)
@@ -2787,6 +3170,17 @@ INSTRUCȚIUNI:
             "memory_hits": memory_hits or [],
             "tasks": tasks_snapshot,
             "provenance": [],
+            "citation_map": external_citation_map,
+            "retrieval_metrics": {
+                "vector_hits": 0,
+                "memory_hits": len(memory_hits or []),
+                "note_hits": 0,
+                "graph_hits": 0,
+                "used_web": True,
+                "used_hyde": bool(self.config.enable_hyde),
+                "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                "citation_invalid": citation_validation["invalid"],
+            },
             "external_sources": external_sources,
             "cached": False,
             "response_time": response_time,
@@ -2797,6 +3191,18 @@ INSTRUCȚIUNI:
             "active_collection": active_collection,
             "route_used": route_used,
             "router_reason": router_reason or f"fallback:{reason}",
+            "auto_captured": {
+                "tasks": task_outcome["auto_saved"],
+                "preferences": preference_outcome["auto_saved"],
+                "decisions": decision_outcome["auto_saved"],
+                "notes": note_outcome["auto_saved"],
+            },
+            "proposed_artifacts": {
+                "notes": note_outcome["proposed"],
+                "tasks": task_outcome["proposed"],
+                "decisions": decision_outcome["proposed"],
+                "preferences": preference_outcome["proposed"],
+            },
         }
 
     def query(
@@ -2905,7 +3311,14 @@ INSTRUCȚIUNI:
                 top_k=3,
             ) if include_memory else []
 
-            if not vector_docs and not graph_paths and not note_hits:
+            memory_topic_scope = active_collection if scope_mode == "topic" else None
+            memory_artifact_hits = self.search_memory_artifacts(
+                query=question,
+                topic_collection=memory_topic_scope,
+                top_k=6,
+            ) if include_memory else []
+
+            if not vector_docs and not graph_paths and not note_hits and not memory_artifact_hits:
                 return self._run_external_fallback(
                     question,
                     start_time,
@@ -2917,6 +3330,10 @@ INSTRUCȚIUNI:
                     memory_hits=memory_hits,
                 )
 
+            if not vector_docs and not graph_paths and memory_artifact_hits:
+                route_used = "memory"
+                router_reason = f"memory_artifacts_available:{router_reason}"
+
             context_payload = self._build_route_context(
                 question=question,
                 route=route_used,
@@ -2924,12 +3341,19 @@ INSTRUCȚIUNI:
                 graph_paths=graph_paths,
                 memory_hits=memory_hits,
                 note_hits=note_hits,
+                memory_artifacts=memory_artifact_hits,
             )
             prompt = context_payload.get("prompt", "")
             selected_vector_docs = context_payload.get("selected_vector_docs", vector_docs)
             provenance = context_payload.get("provenance", [])
             graph_sources = context_payload.get("graph_sources", [])
             note_sources = context_payload.get("note_sources", [])
+            memory_artifacts = context_payload.get("memory_artifacts", memory_artifact_hits)
+            citation_map = {
+                entry.get("citation"): entry.get("source")
+                for entry in provenance
+                if entry.get("citation")
+            }
 
             if not prompt:
                 return self._run_external_fallback(
@@ -2963,6 +3387,8 @@ INSTRUCȚIUNI:
                             memory_hits=memory_hits,
                         )
 
+                    citation_validation = self._validate_citations(cached_response, citation_map)
+                    cached_response = citation_validation["response"]
                     response_time = time.time() - start_time
                     if self.repository and self.repository.enabled:
                         self.repository.log_retrieval(
@@ -2970,9 +3396,19 @@ INSTRUCȚIUNI:
                             route_used=route_used,
                             latency_ms=response_time * 1000.0,
                             metrics={
+                                "answer_origin": "internal",
+                                "vector_hits": len(selected_vector_docs),
+                                "memory_hits": len(memory_hits) + len(memory_artifacts),
+                                "note_hits": len(note_sources),
+                                "graph_hits": len(graph_sources),
+                                "external_sources": 0,
+                                "used_web": False,
+                                "used_hyde": bool(self.config.enable_hyde),
+                                "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
                                 "cached": True,
-                                "vector_docs": len(selected_vector_docs),
-                                "graph_paths": len(graph_sources),
+                                "error": None,
+                                "citation_invalid": citation_validation["invalid"],
+                                "citation_used": citation_validation["used"],
                             },
                         )
 
@@ -2980,16 +3416,24 @@ INSTRUCȚIUNI:
                         question=question,
                         active_collection=active_collection,
                     )
-                    if preference_candidates:
-                        self._persist_preferences(preference_candidates)
+                    preference_outcome = self._process_memory_candidates("preference", preference_candidates)
+
+                    decision_candidate = self._extract_decision_candidate(
+                        question=question,
+                        response=cached_response,
+                        active_collection=active_collection,
+                    )
+                    decision_outcome = self._process_memory_candidates(
+                        "decision",
+                        [decision_candidate] if decision_candidate else [],
+                    )
 
                     task_candidates = self._extract_task_candidates(
                         question=question,
                         response=cached_response,
                         active_collection=active_collection,
                     )
-                    if task_candidates:
-                        self._persist_tasks(task_candidates)
+                    task_outcome = self._process_memory_candidates("task", task_candidates)
 
                     note_candidates = self._extract_note_candidates(
                         question=question,
@@ -3010,9 +3454,21 @@ INSTRUCȚIUNI:
                         "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
                         "graph_sources": graph_sources,
                         "memory_hits": memory_hits,
+                        "memory_sources": memory_artifacts,
                         "note_sources": note_sources,
                         "tasks": self.list_tasks(active_collection=active_collection, limit=20),
                         "provenance": provenance,
+                        "citation_map": citation_map,
+                        "retrieval_metrics": {
+                            "vector_hits": len(selected_vector_docs),
+                            "memory_hits": len(memory_hits) + len(memory_artifacts),
+                            "note_hits": len(note_sources),
+                            "graph_hits": len(graph_sources),
+                            "used_web": False,
+                            "used_hyde": bool(self.config.enable_hyde),
+                            "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                            "citation_invalid": citation_validation["invalid"],
+                        },
                         "external_sources": [],
                         "cached": True,
                         "response_time": response_time,
@@ -3023,13 +3479,16 @@ INSTRUCȚIUNI:
                         "route_used": route_used,
                         "router_reason": router_reason,
                         "auto_captured": {
-                            "tasks": list(task_candidates or []),
-                            "preferences": list(preference_candidates or []),
-                            "decisions": [],
+                            "tasks": task_outcome["auto_saved"],
+                            "preferences": preference_outcome["auto_saved"],
+                            "decisions": decision_outcome["auto_saved"],
                             "notes": note_outcome["auto_saved"],
                         },
                         "proposed_artifacts": {
                             "notes": note_outcome["proposed"],
+                            "tasks": task_outcome["proposed"],
+                            "decisions": decision_outcome["proposed"],
+                            "preferences": preference_outcome["proposed"],
                         },
                     }
             
@@ -3059,6 +3518,8 @@ INSTRUCȚIUNI:
                 )
             
             # Actualizează statistici
+            citation_validation = self._validate_citations(response, citation_map)
+            response = citation_validation["response"]
             response_time = time.time() - start_time
             self._update_avg_response_time(response_time)
 
@@ -3066,16 +3527,17 @@ INSTRUCȚIUNI:
                 question=question,
                 active_collection=active_collection,
             )
-            if preference_candidates:
-                self._persist_preferences(preference_candidates)
+            preference_outcome = self._process_memory_candidates("preference", preference_candidates)
 
             decision_candidate = self._extract_decision_candidate(
                 question=question,
                 response=response,
                 active_collection=active_collection,
             )
-            if decision_candidate:
-                self._persist_decision(decision_candidate)
+            decision_outcome = self._process_memory_candidates(
+                "decision",
+                [decision_candidate] if decision_candidate else [],
+            )
 
             self._capture_episode(
                 question=question,
@@ -3088,8 +3550,7 @@ INSTRUCȚIUNI:
                 response=response,
                 active_collection=active_collection,
             )
-            if task_candidates:
-                self._persist_tasks(task_candidates)
+            task_outcome = self._process_memory_candidates("task", task_candidates)
 
             note_candidates = self._extract_note_candidates(
                 question=question,
@@ -3107,10 +3568,19 @@ INSTRUCȚIUNI:
                     route_used=route_used,
                     latency_ms=response_time * 1000.0,
                     metrics={
+                        "answer_origin": "internal",
+                        "vector_hits": len(selected_vector_docs),
+                        "memory_hits": len(memory_hits) + len(memory_artifacts),
+                        "note_hits": len(note_sources),
+                        "graph_hits": len(graph_sources),
+                        "external_sources": 0,
+                        "used_web": False,
+                        "used_hyde": bool(self.config.enable_hyde),
+                        "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
                         "cached": False,
-                        "vector_docs": len(selected_vector_docs),
-                        "graph_paths": len(graph_sources),
-                        "memory_hits": len(memory_hits),
+                        "error": None,
+                        "citation_invalid": citation_validation["invalid"],
+                        "citation_used": citation_validation["used"],
                     },
                 )
             
@@ -3119,9 +3589,21 @@ INSTRUCȚIUNI:
                 "sources": [doc.get("metadata", {}) for doc in selected_vector_docs],
                 "graph_sources": graph_sources,
                 "memory_hits": memory_hits,
+                "memory_sources": memory_artifacts,
                 "note_sources": note_sources,
                 "tasks": tasks_snapshot,
                 "provenance": provenance,
+                "citation_map": citation_map,
+                "retrieval_metrics": {
+                    "vector_hits": len(selected_vector_docs),
+                    "memory_hits": len(memory_hits) + len(memory_artifacts),
+                    "note_hits": len(note_sources),
+                    "graph_hits": len(graph_sources),
+                    "used_web": False,
+                    "used_hyde": bool(self.config.enable_hyde),
+                    "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                    "citation_invalid": citation_validation["invalid"],
+                },
                 "external_sources": [],
                 "cached": False,
                 "response_time": response_time,
@@ -3133,18 +3615,41 @@ INSTRUCȚIUNI:
                 "route_used": route_used,
                 "router_reason": router_reason,
                 "auto_captured": {
-                    "tasks": list(task_candidates or []),
-                    "preferences": list(preference_candidates or []),
-                    "decisions": [decision_candidate] if decision_candidate else [],
+                    "tasks": task_outcome["auto_saved"],
+                    "preferences": preference_outcome["auto_saved"],
+                    "decisions": decision_outcome["auto_saved"],
                     "notes": note_outcome["auto_saved"],
                 },
                 "proposed_artifacts": {
                     "notes": note_outcome["proposed"],
+                    "tasks": task_outcome["proposed"],
+                    "decisions": decision_outcome["proposed"],
+                    "preferences": preference_outcome["proposed"],
                 },
             }
             
         except Exception as e:
             logger.error(f"Eroare la procesarea query-ului: {e}")
+            response_time = time.time() - start_time
+            if self.repository and self.repository.enabled:
+                self.repository.log_retrieval(
+                    question=question,
+                    route_used=locals().get("route_used", "error"),
+                    latency_ms=response_time * 1000.0,
+                    metrics={
+                        "answer_origin": "error",
+                        "vector_hits": 0,
+                        "memory_hits": 0,
+                        "note_hits": 0,
+                        "graph_hits": 0,
+                        "external_sources": 0,
+                        "used_web": False,
+                        "used_hyde": bool(self.config.enable_hyde),
+                        "used_reranker": bool(self.reranker and self.reranker.available and self.config.enable_reranker),
+                        "cached": False,
+                        "error": str(e),
+                    },
+                )
             return {
                 "response": f"Ne pare rău, a apărut o eroare: {str(e)[:100]}...",
                 "sources": [],
@@ -3154,7 +3659,7 @@ INSTRUCȚIUNI:
                 "provenance": [],
                 "external_sources": [],
                 "cached": False,
-                "response_time": time.time() - start_time,
+                "response_time": response_time,
                 "error": str(e),
                 "answer_origin": "error",
                 "route_used": "error",
@@ -3280,6 +3785,34 @@ INSTRUCȚIUNI:
             )
         return {"nodes": [], "edges": []}
 
+    def rebuild_graph_projection(
+        self,
+        max_chunks: int = 5000,
+        max_artifacts: int = 5000,
+    ) -> Dict[str, int]:
+        """Rebuild Neo4j as a derived projection from canonical Postgres data."""
+        if not (self.graph_ingestion and self.graph_ingestion.enabled):
+            return {"error": "graph_ingestion_unavailable"}
+        if not (self.repository and self.repository.enabled):
+            return {"error": "postgres_repository_unavailable"}
+
+        chunks = (
+            self.repository.list_indexed_chunks(limit=max_chunks)
+            if hasattr(self.repository, "list_indexed_chunks")
+            else []
+        )
+        artifacts = (
+            self.repository.list_memory_artifacts(limit=max_artifacts)
+            if hasattr(self.repository, "list_memory_artifacts")
+            else []
+        )
+        if hasattr(self.graph_ingestion, "rebuild_projection"):
+            return self.graph_ingestion.rebuild_projection(
+                chunks=chunks,
+                memory_artifacts=artifacts,
+            )
+        return {"error": "rebuild_projection_unavailable"}
+
     def get_contradictions(self, limit: int = 20, include_dismissed: bool = False) -> List[Dict[str, Any]]:
         """Returns contradiction pairs from graph for E4 contradiction panel."""
         if self.neo4j_client and self.neo4j_client.enabled:
@@ -3307,6 +3840,43 @@ INSTRUCȚIUNI:
             return self.repository.list_all_decisions(topic_collection=topic_collection, limit=limit) or []
         return []
 
+    def create_decision_manual(
+        self,
+        title: str,
+        rationale: str = "",
+        topic_collection: str = "",
+        confidence: float = 1.0,
+    ) -> Optional[int]:
+        if self.repository and self.repository.enabled:
+            decision_id = self.repository.save_decision(
+                title=title,
+                rationale=rationale,
+                topic_collection=topic_collection,
+                confidence=float(confidence),
+            )
+            if decision_id:
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="decision",
+                    source_table="decisions",
+                    source_id=decision_id,
+                    title=title,
+                    content=rationale,
+                    topic_collection=topic_collection,
+                    confidence=float(confidence),
+                    metadata={"decision_id": decision_id},
+                )
+                self._record_memory_event(
+                    event_type="decision",
+                    artifact_type="decision",
+                    artifact_id=artifact_id,
+                    topic_collection=topic_collection,
+                    title=title,
+                    preview=(rationale or "")[:250],
+                    metadata={"decision_id": decision_id, "confidence": float(confidence)},
+                )
+            return decision_id
+        return None
+
     def update_decision(
         self,
         decision_id: int,
@@ -3316,24 +3886,100 @@ INSTRUCȚIUNI:
         confidence: Optional[float] = None,
     ) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.update_decision(
+            ok = self.repository.update_decision(
                 decision_id=decision_id,
                 title=title,
                 rationale=rationale,
                 topic_collection=topic_collection,
                 confidence=confidence,
             )
+            if ok and hasattr(self.repository, "get_decision"):
+                decision = self.repository.get_decision(decision_id) or {}
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="decision",
+                    source_table="decisions",
+                    source_id=decision_id,
+                    title=decision.get("title", ""),
+                    content=decision.get("rationale", ""),
+                    topic_collection=decision.get("topic_collection", ""),
+                    confidence=float(decision.get("confidence", 0.0) or 0.0),
+                    metadata={"decision_id": decision_id},
+                )
+                self._record_memory_event(
+                    event_type="decision_updated",
+                    artifact_type="decision",
+                    artifact_id=artifact_id,
+                    topic_collection=decision.get("topic_collection", ""),
+                    title=decision.get("title", ""),
+                    preview=decision.get("rationale", "")[:250],
+                    metadata={"decision_id": decision_id},
+                )
+            return ok
         return False
 
     def delete_decision(self, decision_id: int) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.delete_decision(decision_id=decision_id)
+            decision = self.repository.get_decision(decision_id) if hasattr(self.repository, "get_decision") else None
+            ok = self.repository.delete_decision(decision_id=decision_id)
+            if ok:
+                self.repository.delete_memory_artifact(
+                    artifact_type="decision",
+                    source_table="decisions",
+                    source_id=decision_id,
+                )
+                self._record_memory_event(
+                    event_type="decision_deleted",
+                    artifact_type="decision",
+                    topic_collection=(decision or {}).get("topic_collection", ""),
+                    title=(decision or {}).get("title", f"Decizie #{decision_id}"),
+                    preview=(decision or {}).get("rationale", "")[:250],
+                    metadata={"decision_id": decision_id},
+                )
+            return ok
         return False
 
     def list_all_preferences(self, topic_collection: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
         if self.repository and self.repository.enabled:
             return self.repository.list_all_preferences(topic_collection=topic_collection, limit=limit) or []
         return []
+
+    def create_preference_manual(
+        self,
+        preference_key: str,
+        preference_value: str,
+        topic_collection: str = "",
+        confidence: float = 1.0,
+    ) -> Optional[int]:
+        if self.repository and self.repository.enabled:
+            pref_id = self.repository.upsert_preference(
+                preference_key=preference_key,
+                preference_value=preference_value,
+                topic_collection=topic_collection,
+                confidence=float(confidence),
+            )
+            if pref_id:
+                title = f"Preferinta: {preference_key}"
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="preference",
+                    source_table="preferences",
+                    source_id=pref_id,
+                    title=title,
+                    content=preference_value,
+                    topic_collection=topic_collection,
+                    confidence=float(confidence),
+                    metadata={"preference_id": pref_id, "preference_key": preference_key},
+                )
+                self._record_memory_event(
+                    event_type="preference_updated",
+                    artifact_type="preference",
+                    artifact_id=artifact_id,
+                    topic_collection=topic_collection,
+                    title=title,
+                    preview=(preference_value or "")[:250],
+                    metadata={"preference_id": pref_id, "preference_key": preference_key},
+                )
+            return pref_id
+        return None
 
     def update_preference(
         self,
@@ -3343,17 +3989,56 @@ INSTRUCȚIUNI:
         topic_collection: Optional[str] = None,
     ) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.update_preference(
+            ok = self.repository.update_preference(
                 preference_id=preference_id,
                 preference_value=preference_value,
                 confidence=confidence,
                 topic_collection=topic_collection,
             )
+            if ok and hasattr(self.repository, "get_preference"):
+                pref = self.repository.get_preference(preference_id) or {}
+                title = f"Preferinta: {pref.get('preference_key', '')}"
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="preference",
+                    source_table="preferences",
+                    source_id=preference_id,
+                    title=title,
+                    content=pref.get("preference_value", ""),
+                    topic_collection=pref.get("topic_collection", ""),
+                    confidence=float(pref.get("confidence", 0.0) or 0.0),
+                    metadata={"preference_id": preference_id, "preference_key": pref.get("preference_key", "")},
+                )
+                self._record_memory_event(
+                    event_type="preference_updated",
+                    artifact_type="preference",
+                    artifact_id=artifact_id,
+                    topic_collection=pref.get("topic_collection", ""),
+                    title=title,
+                    preview=pref.get("preference_value", "")[:250],
+                    metadata={"preference_id": preference_id},
+                )
+            return ok
         return False
 
     def delete_preference(self, preference_id: int) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.delete_preference(preference_id=preference_id)
+            pref = self.repository.get_preference(preference_id) if hasattr(self.repository, "get_preference") else None
+            ok = self.repository.delete_preference(preference_id=preference_id)
+            if ok:
+                self.repository.delete_memory_artifact(
+                    artifact_type="preference",
+                    source_table="preferences",
+                    source_id=preference_id,
+                )
+                self._record_memory_event(
+                    event_type="preference_deleted",
+                    artifact_type="preference",
+                    topic_collection=(pref or {}).get("topic_collection", ""),
+                    title=f"Preferinta: {(pref or {}).get('preference_key', preference_id)}",
+                    preview=(pref or {}).get("preference_value", "")[:250],
+                    metadata={"preference_id": preference_id},
+                )
+            return ok
         return False
 
     def list_retrieval_logs(self, limit: int = 100, route_filter: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -3387,6 +4072,84 @@ INSTRUCȚIUNI:
             return self.repository.list_top_preferences(limit=limit)
         return []
 
+    def list_memory_proposals(
+        self,
+        status: str = "pending",
+        topic_collection: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        if self.repository and self.repository.enabled and hasattr(self.repository, "list_memory_proposals"):
+            return self.repository.list_memory_proposals(
+                status=status,
+                topic_collection=topic_collection,
+                limit=limit,
+            ) or []
+        return []
+
+    def dismiss_memory_proposal(self, proposal_id: int) -> bool:
+        if self.repository and self.repository.enabled and hasattr(self.repository, "resolve_memory_proposal"):
+            return self.repository.resolve_memory_proposal(proposal_id, "dismissed")
+        return False
+
+    def accept_memory_proposal(
+        self,
+        proposal_id: int,
+        edited_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not (self.repository and self.repository.enabled and hasattr(self.repository, "list_memory_proposals")):
+            return False
+        proposals = self.repository.list_memory_proposals(status="pending", limit=200)
+        proposal = next((p for p in proposals if int(p.get("id")) == int(proposal_id)), None)
+        if not proposal:
+            return False
+
+        payload = dict(proposal.get("payload") or {})
+        if edited_payload:
+            payload.update({k: v for k, v in edited_payload.items() if v is not None})
+        proposal_type = proposal.get("proposal_type", "")
+        topic = payload.get("topic_collection", proposal.get("topic_collection", "")) or ""
+        ok = False
+
+        if proposal_type == "note":
+            ok = bool(self.create_note(
+                content=payload.get("content", ""),
+                title=payload.get("title", ""),
+                topic_collection=topic,
+                tags=payload.get("tags", []),
+            ))
+        elif proposal_type == "task":
+            ok = bool(self.create_task_manual(
+                title=payload.get("title", ""),
+                details=payload.get("details", ""),
+                topic_collection=topic,
+                priority=payload.get("priority", "normal"),
+                due_at=payload.get("due_at"),
+            ))
+        elif proposal_type == "decision":
+            self._persist_decision({
+                "id": f"proposal_decision_{proposal_id}",
+                "title": payload.get("title", ""),
+                "rationale": payload.get("rationale", payload.get("content", "")),
+                "topic_collection": topic,
+                "confidence": float(proposal.get("confidence", 0.7) or 0.7),
+                "source": "memory_proposal",
+            })
+            ok = True
+        elif proposal_type == "preference":
+            self._persist_preferences([
+                {
+                    "preference_key": payload.get("preference_key", "user_preference"),
+                    "preference_value": payload.get("preference_value", payload.get("content", "")),
+                    "topic_collection": topic,
+                    "confidence": float(proposal.get("confidence", 0.7) or 0.7),
+                }
+            ])
+            ok = True
+
+        if ok and hasattr(self.repository, "resolve_memory_proposal"):
+            self.repository.resolve_memory_proposal(proposal_id, "accepted")
+        return ok
+
     # ------------------------------------------------------------------
     # Notes — user-authored Second Brain primitive
     # ------------------------------------------------------------------
@@ -3408,6 +4171,221 @@ INSTRUCȚIUNI:
             logger.warning("_embed_note_text failed: %s", exc)
             return None
 
+    @staticmethod
+    def _citation_prefix_for_artifact(artifact_type: str) -> str:
+        return {
+            "note": "N",
+            "decision": "Dec",
+            "preference": "P",
+            "task": "T",
+            "episode": "Ep",
+            "synthesis": "S",
+        }.get((artifact_type or "").strip().lower(), "M")
+
+    @staticmethod
+    def _validate_citations(
+        response: str,
+        citation_map: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Strip hallucinated citation markers and report what was removed."""
+        text = response or ""
+        allowed = {str(key).strip("[]") for key in (citation_map or {}).keys() if key}
+        pattern = re.compile(r"\[((?:Dec|Ep|D|N|G|M|P|T|W|S)\d+)\]")
+        used = pattern.findall(text)
+        invalid = sorted({citation for citation in used if citation not in allowed})
+        if invalid:
+            invalid_set = set(invalid)
+
+            def _replace(match: re.Match) -> str:
+                citation = match.group(1)
+                return "" if citation in invalid_set else match.group(0)
+
+            text = pattern.sub(_replace, text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+        return {
+            "response": text,
+            "used": sorted({citation for citation in used if citation in allowed}),
+            "invalid": invalid,
+            "allowed": sorted(allowed),
+        }
+
+    def _upsert_memory_artifact(
+        self,
+        artifact_type: str,
+        source_table: str,
+        source_id: Any,
+        title: str,
+        content: str,
+        topic_collection: str = "",
+        tags: Optional[List[str]] = None,
+        confidence: float = 1.0,
+        status: str = "active",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Mirror a source row into the canonical memory artifact index."""
+        if not self.repository or not self.repository.enabled:
+            return None
+        embedding = self._embed_note_text(title, content)
+        artifact_id = self.repository.upsert_memory_artifact(
+            artifact_type=artifact_type,
+            source_table=source_table,
+            source_id=source_id,
+            title=title,
+            content=content,
+            topic_collection=topic_collection,
+            tags=tags,
+            confidence=confidence,
+            status=status,
+            metadata=metadata,
+            embedding=embedding,
+        )
+        if artifact_id and self.graph_ingestion and self.graph_ingestion.enabled:
+            try:
+                if hasattr(self.graph_ingestion, "ingest_memory_artifacts"):
+                    self.graph_ingestion.ingest_memory_artifacts([
+                        {
+                            "id": artifact_id,
+                            "artifact_type": artifact_type,
+                            "source_table": source_table,
+                            "source_id": str(source_id),
+                            "title": title,
+                            "content": content,
+                            "topic_collection": topic_collection,
+                            "confidence": confidence,
+                        }
+                    ])
+            except Exception as exc:
+                logger.warning("memory artifact graph projection failed: %s", exc)
+        return artifact_id
+
+    def _record_memory_event(
+        self,
+        event_type: str,
+        artifact_type: str = "",
+        artifact_id: Optional[int] = None,
+        topic_collection: str = "",
+        title: str = "",
+        preview: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        occurred_at: Optional[str] = None,
+    ) -> None:
+        if not self.repository or not self.repository.enabled:
+            return
+        self.repository.create_memory_event(
+            event_type=event_type,
+            artifact_type=artifact_type,
+            artifact_id=artifact_id,
+            topic_collection=topic_collection,
+            title=title,
+            preview=preview,
+            metadata=metadata,
+            occurred_at=occurred_at,
+        )
+
+    def search_memory_artifacts(
+        self,
+        query: str,
+        topic_collection: Optional[str] = None,
+        top_k: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Vector search over canonical memory artifacts with typed citations."""
+        if not self.repository or not self.repository.enabled:
+            return []
+        embedding = self._embed_note_text("", query)
+        if embedding is None:
+            return []
+        artifacts = self.repository.vector_search_memory(
+            query_embedding=embedding,
+            topic_collection=topic_collection,
+            top_k=top_k,
+        )
+        counters: Dict[str, int] = {}
+        normalized: List[Dict[str, Any]] = []
+        for artifact in artifacts:
+            artifact_type = artifact.get("artifact_type", "memory")
+            prefix = self._citation_prefix_for_artifact(artifact_type)
+            counters[prefix] = counters.get(prefix, 0) + 1
+            citation = f"{prefix}{counters[prefix]}"
+            item = artifact.copy()
+            item["citation"] = citation
+            item["memory_type"] = artifact_type
+            item["rationale"] = artifact.get("content", "")
+            item["source"] = f"memory_artifact:{artifact_type}"
+            normalized.append(item)
+        return normalized
+
+    def backfill_memory_artifacts(self, limit: int = 500) -> Dict[str, Any]:
+        """Build canonical memory artifacts for pre-existing rows."""
+        result: Dict[str, Any] = {
+            "success": False,
+            "processed": 0,
+            "created": 0,
+            "failed": 0,
+            "by_type": {},
+            "error": None,
+        }
+        if not (self.repository and self.repository.enabled):
+            result["error"] = "postgres_unavailable"
+            return result
+        if not hasattr(self.repository, "list_memory_backfill_candidates"):
+            result["error"] = "repository_backfill_unavailable"
+            return result
+
+        candidates = self.repository.list_memory_backfill_candidates(limit=limit) or []
+        for candidate in candidates:
+            result["processed"] += 1
+            artifact_type = candidate.get("artifact_type", "memory")
+            try:
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type=artifact_type,
+                    source_table=candidate.get("source_table", ""),
+                    source_id=candidate.get("source_id", ""),
+                    title=candidate.get("title", ""),
+                    content=candidate.get("content", ""),
+                    topic_collection=candidate.get("topic_collection", ""),
+                    tags=candidate.get("tags", []),
+                    confidence=float(candidate.get("confidence", 1.0) or 1.0),
+                    status=candidate.get("status", "active"),
+                    metadata={
+                        **(candidate.get("metadata") or {}),
+                        "backfilled": True,
+                        "created_at": candidate.get("created_at"),
+                        "updated_at": candidate.get("updated_at"),
+                    },
+                )
+                if artifact_id:
+                    result["created"] += 1
+                    result["by_type"][artifact_type] = int(result["by_type"].get(artifact_type, 0)) + 1
+                    self._record_memory_event(
+                        event_type=candidate.get("event_type", f"{artifact_type}_backfilled"),
+                        artifact_type=artifact_type,
+                        artifact_id=artifact_id,
+                        topic_collection=candidate.get("topic_collection", ""),
+                        title=candidate.get("title", ""),
+                        preview=(candidate.get("content", "") or "")[:250],
+                        metadata={
+                            "source_table": candidate.get("source_table", ""),
+                            "source_id": candidate.get("source_id", ""),
+                            "backfilled": True,
+                        },
+                        occurred_at=candidate.get("created_at"),
+                    )
+                else:
+                    result["failed"] += 1
+            except Exception as exc:
+                logger.warning(
+                    "memory backfill failed for %s:%s: %s",
+                    artifact_type,
+                    candidate.get("source_id"),
+                    exc,
+                )
+                result["failed"] += 1
+
+        result["success"] = result["failed"] == 0
+        if hasattr(self.repository, "get_memory_artifact_counts"):
+            result["counts"] = self.repository.get_memory_artifact_counts()
+        return result
+
     def create_note(
         self,
         content: str,
@@ -3419,13 +4397,35 @@ INSTRUCȚIUNI:
         if not self.repository or not self.repository.enabled:
             return None
         embedding = self._embed_note_text(title, content)
-        return self.repository.create_note(
+        note_id = self.repository.create_note(
             content=content,
             title=title,
             topic_collection=topic_collection,
             tags=tags,
             embedding=embedding,
         )
+        if note_id:
+            artifact_id = self._upsert_memory_artifact(
+                artifact_type="note",
+                source_table="notes",
+                source_id=note_id,
+                title=title or f"Nota #{note_id}",
+                content=content,
+                topic_collection=topic_collection,
+                tags=tags,
+                confidence=1.0,
+                metadata={"note_id": note_id},
+            )
+            self._record_memory_event(
+                event_type="note_created",
+                artifact_type="note",
+                artifact_id=artifact_id,
+                topic_collection=topic_collection,
+                title=title or f"Nota #{note_id}",
+                preview=content[:250],
+                metadata={"note_id": note_id, "tags": tags or []},
+            )
+        return note_id
 
     def update_note(
         self,
@@ -3444,7 +4444,7 @@ INSTRUCȚIUNI:
             final_title = title if title is not None else current.get("title", "")
             final_content = content if content is not None else current.get("content", "")
             embedding = self._embed_note_text(final_title, final_content)
-        return self.repository.update_note(
+        ok = self.repository.update_note(
             note_id=note_id,
             title=title,
             content=content,
@@ -3452,11 +4452,50 @@ INSTRUCȚIUNI:
             tags=tags,
             embedding=embedding,
         )
+        if ok:
+            current = self.repository.get_note(note_id) or {}
+            artifact_id = self._upsert_memory_artifact(
+                artifact_type="note",
+                source_table="notes",
+                source_id=note_id,
+                title=current.get("title", "") or f"Nota #{note_id}",
+                content=current.get("content", ""),
+                topic_collection=current.get("topic_collection", ""),
+                tags=current.get("tags", []),
+                confidence=1.0,
+                metadata={"note_id": note_id},
+            )
+            self._record_memory_event(
+                event_type="note_updated",
+                artifact_type="note",
+                artifact_id=artifact_id,
+                topic_collection=current.get("topic_collection", ""),
+                title=current.get("title", "") or f"Nota #{note_id}",
+                preview=(current.get("content", "") or "")[:250],
+                metadata={"note_id": note_id},
+            )
+        return ok
 
     def delete_note(self, note_id: int) -> bool:
         if not self.repository or not self.repository.enabled:
             return False
-        return self.repository.delete_note(note_id)
+        current = self.repository.get_note(note_id) or {}
+        ok = self.repository.delete_note(note_id)
+        if ok:
+            self.repository.delete_memory_artifact(
+                artifact_type="note",
+                source_table="notes",
+                source_id=note_id,
+            )
+            self._record_memory_event(
+                event_type="note_deleted",
+                artifact_type="note",
+                topic_collection=current.get("topic_collection", ""),
+                title=current.get("title", "") or f"Nota #{note_id}",
+                preview=(current.get("content", "") or "")[:250],
+                metadata={"note_id": note_id},
+            )
+        return ok
 
     def get_note(self, note_id: int) -> Optional[Dict[str, Any]]:
         if not self.repository or not self.repository.enabled:
@@ -3520,42 +4559,46 @@ INSTRUCȚIUNI:
             "topic": topic_collection,
             "outline": "",
             "sources_used": {"docs": [], "notes": [], "decisions": [], "preferences": []},
+            "citation_map": {},
+            "citation_invalid": [],
             "model_used": "",
             "error": None,
         }
 
         topic = (topic_collection or "").strip()
-        if not topic:
-            result["error"] = "Topic obligatoriu pentru sinteza."
-            return result
+        scope_label = topic or "Second Brain global"
+        result["topic"] = scope_label
 
         # 1. Documente: vector search cu query derivat din topic name.
         doc_chunks: List[Dict[str, Any]] = []
         if self.repository and self.repository.enabled:
             try:
-                doc_query = f"concepte principale, idei centrale, concluzii, sumar despre {topic}"
+                doc_query = f"concepte principale, idei centrale, concluzii, sumar despre {scope_label}"
                 doc_embedding = self._embed_note_text("", doc_query)
                 if doc_embedding:
                     doc_chunks = self.repository.vector_search(
                         query_embedding=doc_embedding,
-                        collection_filters=[topic],
+                        collection_filters=[topic] if topic else None,
                         top_k=max_doc_chunks,
                     ) or []
             except Exception as exc:
                 logger.warning("synthesize_topic doc retrieval failed: %s", exc)
 
         # 2. Note proprii.
-        notes = self.list_notes(topic_collection=topic, limit=max_notes) or []
+        notes = self.list_notes(topic_collection=topic if topic else None, limit=max_notes) or []
 
         # 3. Decizii in topic.
         decisions: List[Dict[str, Any]] = []
         if self.repository and self.repository.enabled:
             try:
                 all_decisions = self.repository.list_all_decisions(limit=200) or []
-                decisions = [
-                    d for d in all_decisions
-                    if (d.get("topic_collection") or "").strip() == topic
-                ][:max_decisions]
+                decisions = (
+                    [
+                        d for d in all_decisions
+                        if (d.get("topic_collection") or "").strip() == topic
+                    ]
+                    if topic else all_decisions
+                )[:max_decisions]
             except Exception:
                 pass
 
@@ -3564,27 +4607,39 @@ INSTRUCȚIUNI:
         if self.repository and self.repository.enabled:
             try:
                 all_prefs = self.repository.list_all_preferences(limit=200) or []
-                preferences = [
-                    p for p in all_prefs
-                    if (p.get("topic_collection") or "").strip() == topic
-                ][:max_preferences]
+                preferences = (
+                    [
+                        p for p in all_prefs
+                        if (p.get("topic_collection") or "").strip() == topic
+                    ]
+                    if topic else all_prefs
+                )[:max_preferences]
             except Exception:
                 pass
 
         if not (doc_chunks or notes or decisions or preferences):
             result["error"] = (
-                f"Nu ai inca nimic capturat in topicul '{topic}'. "
+                f"Nu ai inca nimic capturat in scope-ul '{scope_label}'. "
                 "Adauga documente, note sau pune intrebari mai intai."
             )
             return result
 
-        prompt = self._build_synthesis_prompt(topic, doc_chunks, notes, decisions, preferences)
+        prompt = self._build_synthesis_prompt(scope_label, doc_chunks, notes, decisions, preferences)
+        citation_map: Dict[str, Any] = {}
+        citation_map.update({f"D{i}": c.get("metadata", {}) for i, c in enumerate(doc_chunks, 1)})
+        citation_map.update({f"N{i}": n for i, n in enumerate(notes, 1)})
+        citation_map.update({f"Dec{i}": d for i, d in enumerate(decisions, 1)})
+        citation_map.update({f"P{i}": p for i, p in enumerate(preferences, 1)})
 
         try:
             self.rate_limiter.wait_if_needed()
             self.rate_limiter.add_request()
             outline = self.llm.generate(prompt)
-            result["outline"] = (outline or "").strip()
+            self.stats["llm_calls"] += 1
+            validation = self._validate_citations(outline, citation_map)
+            result["outline"] = (validation["response"] or "").strip()
+            result["citation_map"] = citation_map
+            result["citation_invalid"] = validation["invalid"]
             result["model_used"] = self.llm.model_name
             result["sources_used"]["docs"] = [
                 {
@@ -3685,6 +4740,236 @@ INSTRUCȚIUNI:
 
         return "\n".join(parts)
 
+    def analyze_topic_taxonomy(
+        self,
+        topic_collection: str = "",
+        max_doc_chunks: int = 8,
+        max_notes: int = 10,
+        max_memory_artifacts: int = 12,
+    ) -> Dict[str, Any]:
+        """Generate an explicit concept taxonomy from documents, notes, memory and graph."""
+        return self._run_topic_analysis(
+            analysis_type="taxonomy",
+            topic_collection=topic_collection,
+            max_doc_chunks=max_doc_chunks,
+            max_notes=max_notes,
+            max_memory_artifacts=max_memory_artifacts,
+        )
+
+    def analyze_topic_gaps(
+        self,
+        topic_collection: str = "",
+        max_doc_chunks: int = 8,
+        max_notes: int = 10,
+        max_memory_artifacts: int = 12,
+    ) -> Dict[str, Any]:
+        """Generate gap analysis across documents, notes, decisions, preferences and graph."""
+        return self._run_topic_analysis(
+            analysis_type="gap_analysis",
+            topic_collection=topic_collection,
+            max_doc_chunks=max_doc_chunks,
+            max_notes=max_notes,
+            max_memory_artifacts=max_memory_artifacts,
+        )
+
+    def _run_topic_analysis(
+        self,
+        analysis_type: str,
+        topic_collection: str = "",
+        max_doc_chunks: int = 8,
+        max_notes: int = 10,
+        max_memory_artifacts: int = 12,
+    ) -> Dict[str, Any]:
+        topic = (topic_collection or "").strip()
+        scope_label = topic or "Second Brain global"
+        result: Dict[str, Any] = {
+            "analysis_type": analysis_type,
+            "topic": scope_label,
+            "markdown": "",
+            "sources_used": {},
+            "citation_map": {},
+            "citation_invalid": [],
+            "model_used": "",
+            "error": None,
+        }
+        materials = self._collect_topic_analysis_materials(
+            topic=topic,
+            scope_label=scope_label,
+            max_doc_chunks=max_doc_chunks,
+            max_notes=max_notes,
+            max_memory_artifacts=max_memory_artifacts,
+        )
+        if not any(materials.get(key) for key in ("doc_chunks", "notes", "decisions", "preferences", "memory_artifacts", "graph_items")):
+            result["error"] = f"Nu exista suficiente surse pentru analiza in scope-ul '{scope_label}'."
+            return result
+
+        prompt, citation_map = self._build_topic_analysis_prompt(analysis_type, scope_label, materials)
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            markdown = self.llm.generate(prompt)
+            self.stats["llm_calls"] += 1
+            validation = self._validate_citations(markdown, citation_map)
+            result["markdown"] = validation["response"]
+            result["citation_invalid"] = validation["invalid"]
+            result["citation_map"] = citation_map
+            result["model_used"] = self.llm.model_name
+            result["sources_used"] = self._summarize_analysis_sources(materials)
+        except Exception as exc:
+            logger.error("%s generation failed: %s", analysis_type, exc)
+            result["error"] = f"Generarea analizei a esuat: {exc}"
+        return result
+
+    def _collect_topic_analysis_materials(
+        self,
+        topic: str,
+        scope_label: str,
+        max_doc_chunks: int,
+        max_notes: int,
+        max_memory_artifacts: int,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        doc_chunks: List[Dict[str, Any]] = []
+        if self.repository and self.repository.enabled:
+            try:
+                query = f"taxonomy concepts relationships gaps coverage contradictions {scope_label}"
+                embedding = self._embed_note_text("", query)
+                if embedding:
+                    doc_chunks = self.repository.vector_search(
+                        query_embedding=embedding,
+                        collection_filters=[topic] if topic else None,
+                        top_k=max_doc_chunks,
+                    ) or []
+            except Exception as exc:
+                logger.warning("analysis doc retrieval failed: %s", exc)
+
+        notes = self.list_notes(topic_collection=topic if topic else None, limit=max_notes) or []
+
+        decisions: List[Dict[str, Any]] = []
+        preferences: List[Dict[str, Any]] = []
+        memory_artifacts: List[Dict[str, Any]] = []
+        if self.repository and self.repository.enabled:
+            try:
+                all_decisions = self.repository.list_all_decisions(limit=200) or []
+                decisions = (
+                    [d for d in all_decisions if (d.get("topic_collection") or "").strip() == topic]
+                    if topic else all_decisions
+                )[:8]
+            except Exception:
+                pass
+            try:
+                all_prefs = self.repository.list_all_preferences(limit=200) or []
+                preferences = (
+                    [p for p in all_prefs if (p.get("topic_collection") or "").strip() == topic]
+                    if topic else all_prefs
+                )[:8]
+            except Exception:
+                pass
+            try:
+                memory_artifacts = self.repository.list_memory_artifacts(
+                    topic_collection=topic if topic else None,
+                    limit=max_memory_artifacts,
+                ) or []
+            except Exception:
+                pass
+
+        graph_items: List[Dict[str, Any]] = []
+        if self.neo4j_client and self.neo4j_client.enabled:
+            try:
+                graph = self.neo4j_client.get_graph_viz_data(
+                    limit_nodes=60,
+                    collection_filter=topic if topic else None,
+                ) or {}
+                graph_items = list((graph.get("edges") or [])[:20])
+            except Exception:
+                graph_items = []
+
+        return {
+            "doc_chunks": doc_chunks,
+            "notes": notes,
+            "decisions": decisions,
+            "preferences": preferences,
+            "memory_artifacts": memory_artifacts,
+            "graph_items": graph_items,
+        }
+
+    def _build_topic_analysis_prompt(
+        self,
+        analysis_type: str,
+        scope_label: str,
+        materials: Dict[str, List[Dict[str, Any]]],
+    ) -> tuple[str, Dict[str, Any]]:
+        citation_map: Dict[str, Any] = {}
+        parts: List[str] = [
+            f"Esti CerebrumAI. Analizeaza cunostintele din scope-ul '{scope_label}'.",
+            "Foloseste doar materialele de mai jos si citeaza fiecare afirmatie importanta.",
+            "",
+            "MATERIALE:",
+        ]
+
+        for i, chunk in enumerate(materials.get("doc_chunks", []), 1):
+            key = f"D{i}"
+            meta = chunk.get("metadata", {}) or {}
+            citation_map[key] = {"kind": "document", **meta}
+            parts.append(f"[{key}] Document {meta.get('filename', '?')}: {(chunk.get('content', '') or '')[:650]}")
+        for i, note in enumerate(materials.get("notes", []), 1):
+            key = f"N{i}"
+            citation_map[key] = {"kind": "note", **note}
+            parts.append(f"[{key}] Nota {note.get('title') or note.get('id')}: {(note.get('content', '') or '')[:650]}")
+        for i, decision in enumerate(materials.get("decisions", []), 1):
+            key = f"Dec{i}"
+            citation_map[key] = {"kind": "decision", **decision}
+            parts.append(f"[{key}] Decizie {decision.get('title', '?')}: {(decision.get('rationale', '') or '')[:500]}")
+        for i, preference in enumerate(materials.get("preferences", []), 1):
+            key = f"P{i}"
+            citation_map[key] = {"kind": "preference", **preference}
+            parts.append(f"[{key}] Preferinta {preference.get('preference_key', '?')}: {preference.get('preference_value', '')}")
+        for i, artifact in enumerate(materials.get("memory_artifacts", []), 1):
+            key = f"M{i}"
+            citation_map[key] = {"kind": artifact.get("artifact_type", "memory"), **artifact}
+            parts.append(f"[{key}] Memorie {artifact.get('artifact_type', 'memory')} {artifact.get('title', '?')}: {(artifact.get('content', '') or '')[:500]}")
+        for i, edge in enumerate(materials.get("graph_items", []), 1):
+            key = f"G{i}"
+            citation_map[key] = {"kind": "graph", **edge}
+            source = edge.get("source") or edge.get("from") or ""
+            target = edge.get("target") or edge.get("to") or ""
+            rel = edge.get("type") or edge.get("relation") or "RELATED_TO"
+            parts.append(f"[{key}] Graf: {source} -{rel}-> {target}")
+
+        parts.append("")
+        parts.append("INSTRUCTIUNI:")
+        if analysis_type == "taxonomy":
+            parts.extend([
+                "- Genereaza o taxonomie markdown a conceptelor.",
+                "- Include sectiunile: ## Radacina taxonomiei, ## Subteme, ## Relatii intre concepte, ## Concepte ambigue, ## Acoperire pe surse.",
+                "- Marcheaza conceptele care apar doar in note, doar in documente sau doar in graf.",
+                "- Foloseste citatii [D#], [N#], [Dec#], [P#], [M#], [G#].",
+                "- Nu inventa concepte fara sursa citata.",
+            ])
+        else:
+            parts.extend([
+                "- Genereaza o analiza de gap-uri markdown.",
+                "- Include sectiunile: ## Gap-uri majore, ## Concepte insuficient acoperite, ## Note fara suport documentar, ## Documente fara opinie proprie, ## Tensiuni sau contradictii, ## Surse externe recomandate.",
+                "- Pentru surse externe recomandate, propune 3-5 query-uri web concise, nu URL-uri inventate.",
+                "- Foloseste citatii [D#], [N#], [Dec#], [P#], [M#], [G#].",
+                "- Daca nu exista dovezi pentru un gap, spune ca nu poate fi determinat.",
+            ])
+        parts.extend([
+            "- Limba: romana.",
+            "- Output: DOAR markdown, fara preambul.",
+        ])
+        return "\n".join(parts), citation_map
+
+    @staticmethod
+    def _summarize_analysis_sources(materials: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        return {
+            "docs": len(materials.get("doc_chunks", [])),
+            "notes": len(materials.get("notes", [])),
+            "decisions": len(materials.get("decisions", [])),
+            "preferences": len(materials.get("preferences", [])),
+            "memory_artifacts": len(materials.get("memory_artifacts", [])),
+            "graph_edges": len(materials.get("graph_items", [])),
+        }
+
     # ------------------------------------------------------------------
     # Timeline — agregare cronologica a evenimentelor de cunostinte
     # ------------------------------------------------------------------
@@ -3723,6 +5008,44 @@ INSTRUCȚIUNI:
             return (topic_value or "").strip() == topic_collection.strip()
 
         events: List[Dict[str, Any]] = []
+
+        # Prefer canonical append-only memory events when migration 003 is present.
+        try:
+            if hasattr(self.repository, "list_memory_events"):
+                memory_events = self.repository.list_memory_events(
+                    topic_collection=topic_collection,
+                    days=int(days),
+                    event_types=event_types,
+                    limit=int(limit),
+                ) or []
+                icon_map = {
+                    "note_created": "💡",
+                    "note_updated": "✏️",
+                    "note_deleted": "🗑️",
+                    "decision": "⚙️",
+                    "decision_updated": "⚙️",
+                    "task_created": "📌",
+                    "task_updated": "📌",
+                    "task_done": "✅",
+                    "document_added": "📄",
+                    "chat_started": "💬",
+                    "episode_captured": "💬",
+                    "preference_updated": "🎯",
+                    "synthesis_created": "📋",
+                }
+                for event in memory_events:
+                    event_type = event.get("type", "")
+                    events.append({
+                        "type": event_type,
+                        "icon": icon_map.get(event_type, "•"),
+                        "timestamp": event.get("timestamp", ""),
+                        "topic_collection": event.get("topic_collection", "") or "global",
+                        "title": event.get("title", ""),
+                        "preview": event.get("preview", ""),
+                        "metadata": event.get("metadata", {}),
+                    })
+        except Exception as exc:
+            logger.warning("timeline memory_events failed: %s", exc)
 
         # 1. Note (created + updated daca diferite)
         if _wanted("note_created") or _wanted("note_updated"):
@@ -3887,8 +5210,22 @@ INSTRUCȚIUNI:
             except Exception as exc:
                 logger.warning("timeline chats failed: %s", exc)
 
-        events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
-        return events[: int(limit)]
+        deduped_events: List[Dict[str, Any]] = []
+        seen_event_keys = set()
+        for event in events:
+            key = (
+                event.get("type", ""),
+                event.get("title", ""),
+                str(event.get("timestamp", ""))[:16],
+                str((event.get("metadata") or {}).get("id") or (event.get("metadata") or {}).get("artifact_id") or ""),
+            )
+            if key in seen_event_keys:
+                continue
+            seen_event_keys.add(key)
+            deduped_events.append(event)
+
+        deduped_events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+        return deduped_events[: int(limit)]
 
     # ------------------------------------------------------------------
     # Source suggestion mechanism
@@ -3924,9 +5261,17 @@ INSTRUCȚIUNI:
         if self.repository and self.repository.enabled:
             try:
                 prefs = self.repository.list_top_preferences(limit=5)
-                preferences = [p.get("content", "") for p in prefs if p.get("content")]
+                preferences = [
+                    f"{p.get('preference_key', '')}: {p.get('preference_value', '')}"
+                    for p in prefs
+                    if p.get("preference_value")
+                ]
                 decs = self.repository.list_recent_decisions(limit=3)
-                decisions = [d.get("content", "") for d in decs if d.get("content")]
+                decisions = [
+                    f"{d.get('title', '')}: {d.get('rationale', '')}"
+                    for d in decs
+                    if d.get("title") or d.get("rationale")
+                ]
             except Exception:
                 pass
 
@@ -4015,6 +5360,48 @@ INSTRUCȚIUNI:
             logger.warning("_build_suggestion_queries failed: %s", exc)
             return [q for q in recent_questions[-2:] if q]
 
+    def _sync_task_memory_artifact(self, task_id: int, event_type: str = "task_updated") -> None:
+        if not self.repository or not self.repository.enabled or not hasattr(self.repository, "get_task"):
+            return
+        task = self.repository.get_task(task_id)
+        if not task:
+            return
+        content = (
+            f"{task.get('title', '')}\n\n"
+            f"{task.get('details', '')}\n"
+            f"Status: {task.get('status', 'open')}; "
+            f"Prioritate: {task.get('priority', 'normal')}; "
+            f"Scadenta: {task.get('due_at') or 'n/a'}"
+        ).strip()
+        artifact_id = self._upsert_memory_artifact(
+            artifact_type="task",
+            source_table="tasks",
+            source_id=task_id,
+            title=task.get("title", f"Task #{task_id}"),
+            content=content,
+            topic_collection=task.get("topic_collection", ""),
+            confidence=float(task.get("confidence", 1.0) or 1.0),
+            status=task.get("status", "open"),
+            metadata={
+                "task_id": task_id,
+                "priority": task.get("priority", "normal"),
+                "due_at": task.get("due_at"),
+            },
+        )
+        self._record_memory_event(
+            event_type=event_type,
+            artifact_type="task",
+            artifact_id=artifact_id,
+            topic_collection=task.get("topic_collection", ""),
+            title=task.get("title", f"Task #{task_id}"),
+            preview=(task.get("details", "") or "")[:250],
+            metadata={
+                "task_id": task_id,
+                "status": task.get("status", "open"),
+                "priority": task.get("priority", "normal"),
+            },
+        )
+
     def list_all_tasks(
         self,
         topic_collection: Optional[str] = None,
@@ -4046,7 +5433,7 @@ INSTRUCȚIUNI:
     ) -> Optional[int]:
         """Creeaza un task manual (quick capture din UI)."""
         if self.repository and self.repository.enabled:
-            return self.repository.create_task(
+            task_id = self.repository.create_task(
                 title=title,
                 details=details,
                 topic_collection=topic_collection,
@@ -4054,6 +5441,32 @@ INSTRUCȚIUNI:
                 due_at=due_at,
                 confidence=1.0,
             )
+            if task_id:
+                content = (
+                    f"{title}\n\n{details}\n"
+                    f"Prioritate: {priority}; Scadenta: {due_at or 'n/a'}"
+                ).strip()
+                artifact_id = self._upsert_memory_artifact(
+                    artifact_type="task",
+                    source_table="tasks",
+                    source_id=task_id,
+                    title=title,
+                    content=content,
+                    topic_collection=topic_collection,
+                    confidence=1.0,
+                    status="open",
+                    metadata={"task_id": task_id, "priority": priority, "due_at": due_at},
+                )
+                self._record_memory_event(
+                    event_type="task_created",
+                    artifact_type="task",
+                    artifact_id=artifact_id,
+                    topic_collection=topic_collection,
+                    title=title,
+                    preview=details[:250],
+                    metadata={"task_id": task_id, "priority": priority, "due_at": due_at},
+                )
+            return task_id
         return None
 
     def update_task(
@@ -4066,7 +5479,7 @@ INSTRUCȚIUNI:
         topic_collection: Optional[str] = None,
     ) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.update_task(
+            ok = self.repository.update_task(
                 task_id=task_id,
                 title=title,
                 details=details,
@@ -4074,16 +5487,41 @@ INSTRUCȚIUNI:
                 due_at=due_at,
                 topic_collection=topic_collection,
             )
+            if ok:
+                self._sync_task_memory_artifact(task_id, event_type="task_updated")
+            return ok
         return False
 
     def update_task_status(self, task_id: int, status: str) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.update_task_status(task_id=task_id, status=status)
+            ok = self.repository.update_task_status(task_id=task_id, status=status)
+            if ok:
+                self._sync_task_memory_artifact(
+                    task_id,
+                    event_type="task_done" if status == "done" else "task_updated",
+                )
+            return ok
         return False
 
     def delete_task(self, task_id: int) -> bool:
         if self.repository and self.repository.enabled:
-            return self.repository.delete_task(task_id=task_id)
+            current = self.repository.get_task(task_id) if hasattr(self.repository, "get_task") else None
+            ok = self.repository.delete_task(task_id=task_id)
+            if ok:
+                self.repository.delete_memory_artifact(
+                    artifact_type="task",
+                    source_table="tasks",
+                    source_id=task_id,
+                )
+                self._record_memory_event(
+                    event_type="task_deleted",
+                    artifact_type="task",
+                    topic_collection=(current or {}).get("topic_collection", ""),
+                    title=(current or {}).get("title", f"Task #{task_id}"),
+                    preview=(current or {}).get("details", "")[:250],
+                    metadata={"task_id": task_id},
+                )
+            return ok
         return False
 
     def list_open_tasks(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -4198,13 +5636,16 @@ def create_apci_system(api_key: str, config_dict: Dict[str, Any] = None) -> Cere
     
     return CerebrumAISystem(default_config, api_key)
 
+APCISystem = CerebrumAISystem
+
 # Export principal
 __all__ = [
     'CerebrumAISystem', 
+    'APCISystem',
     'RAGConfig', 
     'create_apci_system',
     'OptimizedFlashLLM',
     'GeminiRateLimiter',
-    'SimpleCache'
+    'SimpleCache',
+    'ResponseCache',
 ]
-

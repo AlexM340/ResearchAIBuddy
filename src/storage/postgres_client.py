@@ -7,12 +7,13 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Any, Dict, Generator, Optional
 
 logger = logging.getLogger(__name__)
 
 try:
     import psycopg
+
     PSYCOPG_AVAILABLE = True
 except Exception:
     psycopg = None
@@ -34,7 +35,6 @@ class PostgresClient:
 
         if enabled and not PSYCOPG_AVAILABLE:
             logger.warning("psycopg nu este disponibil; storage Postgres dezactivat.")
-
         if enabled and not self.dsn:
             logger.info("storage.postgres_dsn nu este configurat; storage Postgres dezactivat.")
 
@@ -70,11 +70,11 @@ class PostgresClient:
                 conn.commit()
             return True
         except Exception as exc:
-            logger.warning("Conexiunea Postgres a eșuat: %s", exc)
+            logger.warning("Conexiunea Postgres a esuat: %s", exc)
             return False
 
     def initialize_schema(self, schema_path: Optional[str] = None) -> bool:
-        """Initialize schema from SQL file."""
+        """Initialize schema from SQL file, then apply additive migrations."""
         if not self.enabled:
             return False
 
@@ -91,8 +91,93 @@ class PostgresClient:
                 with conn.cursor() as cur:
                     cur.execute(sql_text)
                 conn.commit()
-            return True
+            return self.run_migrations()
         except Exception as exc:
-            logger.error("Inițializarea schemei Postgres a eșuat: %s", exc)
+            logger.error("Initializarea schemei Postgres a esuat: %s", exc)
             return False
 
+    def run_migrations(self, migrations_dir: Optional[str] = None) -> bool:
+        """Apply SQL migrations once, tracked in schema_migrations."""
+        if not self.enabled:
+            return False
+
+        try:
+            migration_path = (
+                Path(migrations_dir)
+                if migrations_dir
+                else Path(__file__).parent / "migrations"
+            )
+            if not migration_path.exists():
+                return True
+
+            migration_files = sorted(path for path in migration_path.glob("*.sql") if path.is_file())
+            with self.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS schema_migrations (
+                            version TEXT PRIMARY KEY,
+                            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                        """
+                    )
+                    cur.execute("SELECT version FROM schema_migrations;")
+                    applied = {str(row[0]) for row in (cur.fetchall() or [])}
+
+                    for file_path in migration_files:
+                        version = file_path.name
+                        if version in applied:
+                            continue
+                        cur.execute(file_path.read_text(encoding="utf-8"))
+                        cur.execute(
+                            """
+                            INSERT INTO schema_migrations(version, applied_at)
+                            VALUES (%s, NOW())
+                            ON CONFLICT(version) DO NOTHING;
+                            """,
+                            (version,),
+                        )
+                        logger.info("Applied Postgres migration %s", version)
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("Aplicarea migratiilor Postgres a esuat: %s", exc)
+            return False
+
+    def get_migration_status(self, migrations_dir: Optional[str] = None) -> Dict[str, Any]:
+        """Return applied/pending migration names for UI diagnostics."""
+        status: Dict[str, Any] = {"enabled": self.enabled, "applied": [], "pending": [], "error": None}
+        if not self.enabled:
+            return status
+
+        try:
+            migration_path = (
+                Path(migrations_dir)
+                if migrations_dir
+                else Path(__file__).parent / "migrations"
+            )
+            known = sorted(path.name for path in migration_path.glob("*.sql")) if migration_path.exists() else []
+            with self.connection() as conn:
+                if conn is None:
+                    status["error"] = "connection_unavailable"
+                    return status
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS schema_migrations (
+                            version TEXT PRIMARY KEY,
+                            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                        """
+                    )
+                    cur.execute("SELECT version FROM schema_migrations ORDER BY version;")
+                    applied = [str(row[0]) for row in (cur.fetchall() or [])]
+                conn.commit()
+            status["applied"] = applied
+            status["pending"] = [version for version in known if version not in set(applied)]
+            return status
+        except Exception as exc:
+            status["error"] = str(exc)
+            return status

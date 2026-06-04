@@ -290,9 +290,12 @@ def process_question(
             "sources": result.get("sources", []),
             "graph_sources": result.get("graph_sources", []),
             "memory_hits": result.get("memory_hits", []),
+            "memory_sources": result.get("memory_sources", []),
             "note_sources": result.get("note_sources", []),
             "tasks": result.get("tasks", []),
             "provenance": result.get("provenance", []),
+            "citation_map": result.get("citation_map", {}),
+            "retrieval_metrics": result.get("retrieval_metrics", {}),
             "external_sources": result.get("external_sources", []),
             "response_time": result.get("response_time", end_time - start_time),
             "cached": result.get("cached", False),
@@ -383,6 +386,19 @@ def render_chat_history(
                         topic = item.get("topic_collection", "")
                         memory_type = item.get("memory_type", "semantic")
                         st.write(f"{j}. **[{memory_type}] {title}** ({topic})")
+
+            if chat.get("memory_sources"):
+                with st.expander("Surse de memorie indexata"):
+                    for item in chat["memory_sources"]:
+                        citation = item.get("citation", "M?")
+                        title = item.get("title", "Memorie")
+                        artifact_type = item.get("artifact_type", item.get("memory_type", "memory"))
+                        topic = item.get("topic_collection", "") or "global"
+                        score = float(item.get("similarity", item.get("confidence", 0.0)) or 0.0)
+                        st.markdown(f"**[{citation}] {title}** · {artifact_type} · {topic} · score={score:.2f}")
+                        preview = (item.get("content") or item.get("rationale") or "")[:250]
+                        if preview:
+                            st.caption(preview + ("..." if len(preview) >= 250 else ""))
 
             if chat.get("note_sources"):
                 with st.expander("Notele tale relevante"):
@@ -495,7 +511,7 @@ def _render_auto_captured_badges(chat: Dict[str, Any]) -> None:
             st.markdown(f"- {p}")
 
 
-def _render_proposed_artifacts(chat: Dict[str, Any], chat_idx: int) -> None:
+def _render_proposed_artifacts_legacy(chat: Dict[str, Any], chat_idx: int) -> None:
     """Cards de confirmare pentru artifact-uri detectate dar nesigure.
 
     Apar cand confidence-ul detectiei e in zona MEDIUM (0.5-0.85). User-ul
@@ -568,6 +584,140 @@ def _render_proposed_artifacts(chat: Dict[str, Any], chat_idx: int) -> None:
                     st.rerun()
 
 
+def _render_proposed_artifacts(chat: Dict[str, Any], chat_idx: int) -> None:
+    """Cards de confirmare pentru artifact-uri detectate cu confidence MEDIUM."""
+    proposed = chat.get("proposed_artifacts") or {}
+    if not proposed:
+        return
+
+    apci_system = st.session_state.get("apci_system")
+    if not apci_system:
+        return
+
+    dismissed: set = st.session_state.setdefault(_PROPOSAL_DISMISSED_KEY, set())
+    proposal_items: List[tuple[str, int, Dict[str, Any]]] = []
+    for proposal_type, key in (
+        ("note", "notes"),
+        ("task", "tasks"),
+        ("decision", "decisions"),
+        ("preference", "preferences"),
+    ):
+        for idx, item in enumerate(proposed.get(key) or []):
+            proposal_items.append((proposal_type, idx, item))
+
+    def _dismiss_key(proposal_type: str, idx: int, item: Dict[str, Any]):
+        proposal_id = item.get("proposal_id")
+        return ("db", int(proposal_id)) if proposal_id else (chat_idx, proposal_type, idx)
+
+    visible_items = [
+        (proposal_type, idx, item)
+        for proposal_type, idx, item in proposal_items
+        if _dismiss_key(proposal_type, idx, item) not in dismissed
+    ]
+    if not visible_items:
+        return
+
+    with st.container(border=True):
+        st.caption("Am detectat elemente care ar putea merita salvate. Confirma doar ce e corect.")
+
+        for proposal_type, idx, item in visible_items:
+            key = _dismiss_key(proposal_type, idx, item)
+            topic = item.get("topic_collection", "") or "global"
+            conf = float(item.get("confidence", 0.0) or 0.0)
+            title = _proposal_display_title(proposal_type, item)
+            preview = _proposal_display_preview(proposal_type, item)
+
+            st.markdown(f"**{title}**")
+            st.caption(f"{proposal_type} | {topic} | confidence {conf:.0%}")
+            if preview:
+                st.write(preview[:300] + ("..." if len(preview) > 300 else ""))
+
+            col_save, col_skip = st.columns(2)
+            with col_save:
+                if st.button(
+                    "Salveaza",
+                    key=f"propose_save_{chat_idx}_{proposal_type}_{idx}_{item.get('proposal_id', 'local')}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    if _accept_inline_proposal(apci_system, proposal_type, item):
+                        dismissed.add(key)
+                        st.session_state[_PROPOSAL_DISMISSED_KEY] = dismissed
+                        st.success("Salvat in memorie.")
+                        st.rerun()
+                    else:
+                        st.error("Salvare esuata.")
+            with col_skip:
+                if st.button(
+                    "Skip",
+                    key=f"propose_skip_{chat_idx}_{proposal_type}_{idx}_{item.get('proposal_id', 'local')}",
+                    use_container_width=True,
+                ):
+                    proposal_id = item.get("proposal_id")
+                    if proposal_id and hasattr(apci_system, "dismiss_memory_proposal"):
+                        apci_system.dismiss_memory_proposal(int(proposal_id))
+                    dismissed.add(key)
+                    st.session_state[_PROPOSAL_DISMISSED_KEY] = dismissed
+                    st.rerun()
+
+
+def _proposal_display_title(proposal_type: str, item: Dict[str, Any]) -> str:
+    if proposal_type == "preference":
+        return f"Preferinta: {item.get('preference_key', 'preferinta')}"
+    if proposal_type == "task":
+        return item.get("title") or "Task propus"
+    if proposal_type == "decision":
+        return item.get("title") or "Decizie propusa"
+    return item.get("title") or "Nota propusa"
+
+
+def _proposal_display_preview(proposal_type: str, item: Dict[str, Any]) -> str:
+    if proposal_type == "preference":
+        return item.get("preference_value", "")
+    if proposal_type == "task":
+        return item.get("details", "")
+    if proposal_type == "decision":
+        return item.get("rationale", "")
+    return item.get("content", "")
+
+
+def _accept_inline_proposal(apci_system, proposal_type: str, item: Dict[str, Any]) -> bool:
+    proposal_id = item.get("proposal_id")
+    if proposal_id and hasattr(apci_system, "accept_memory_proposal"):
+        return bool(apci_system.accept_memory_proposal(int(proposal_id)))
+
+    topic = item.get("topic_collection", "") or ""
+    if proposal_type == "note" and hasattr(apci_system, "create_note"):
+        return bool(apci_system.create_note(
+            content=item.get("content", ""),
+            title=item.get("title", ""),
+            topic_collection=topic,
+        ))
+    if proposal_type == "task" and hasattr(apci_system, "create_task_manual"):
+        return bool(apci_system.create_task_manual(
+            title=item.get("title", ""),
+            details=item.get("details", ""),
+            topic_collection=topic,
+            priority=item.get("priority", "normal"),
+            due_at=item.get("due_at"),
+        ))
+    if proposal_type == "decision" and hasattr(apci_system, "create_decision_manual"):
+        return bool(apci_system.create_decision_manual(
+            title=item.get("title", ""),
+            rationale=item.get("rationale", ""),
+            topic_collection=topic,
+            confidence=float(item.get("confidence", 1.0) or 1.0),
+        ))
+    if proposal_type == "preference" and hasattr(apci_system, "create_preference_manual"):
+        return bool(apci_system.create_preference_manual(
+            preference_key=item.get("preference_key", "user_preference"),
+            preference_value=item.get("preference_value", ""),
+            topic_collection=topic,
+            confidence=float(item.get("confidence", 1.0) or 1.0),
+        ))
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Common pre-checks pentru view-uri
 # ---------------------------------------------------------------------------
@@ -579,8 +729,17 @@ def system_ready() -> bool:
 
 
 def has_indexed_documents() -> bool:
-    """True daca exista documente indexate (DB sau local)."""
+    """True daca exista documente indexate sau memorie canonica cautabila."""
     if st.session_state.get("documents_loaded"):
         return True
     summary = st.session_state.get("last_sync_summary", {})
-    return int(summary.get("indexed_chunks", 0) or 0) > 0
+    if int(summary.get("indexed_chunks", 0) or 0) > 0:
+        return True
+    apci_system = st.session_state.get("apci_system")
+    repository = getattr(apci_system, "repository", None) if apci_system else None
+    if repository and getattr(repository, "enabled", False) and hasattr(repository, "list_memory_artifacts"):
+        try:
+            return bool(repository.list_memory_artifacts(limit=1))
+        except Exception:
+            return False
+    return False

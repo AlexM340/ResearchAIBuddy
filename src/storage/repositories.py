@@ -41,6 +41,11 @@ class SecondBrainRepository:
             return False
         return self.client.initialize_schema()
 
+    def get_migration_status(self) -> Dict[str, Any]:
+        if not self.enabled or not hasattr(self.client, "get_migration_status"):
+            return {"enabled": False, "applied": [], "pending": [], "error": None}
+        return self.client.get_migration_status()
+
     def upsert_collection(self, name: str, collection_type: str = "topic") -> Optional[int]:
         if not self.enabled:
             return None
@@ -317,6 +322,58 @@ class SecondBrainRepository:
             logger.error("vector_search failed: %s", exc)
             return []
 
+    def list_indexed_chunks(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Return indexed chunks in the same shape expected by graph ingestion."""
+        if not self.enabled:
+            return []
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            chunks.id,
+                            chunks.text,
+                            chunks.chunk_order,
+                            chunks.metadata_json,
+                            documents.id,
+                            documents.source_path,
+                            documents.original_name,
+                            collections.name AS collection_name
+                        FROM chunks
+                        JOIN documents ON documents.id = chunks.document_id
+                        JOIN collections ON collections.id = documents.collection_id
+                        WHERE documents.indexed = TRUE
+                        ORDER BY documents.id ASC, chunks.chunk_order ASC
+                        LIMIT %s;
+                        """,
+                        (int(limit),),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+
+            chunks: List[Dict[str, Any]] = []
+            for row in rows:
+                metadata = row[3] if isinstance(row[3], dict) else (json.loads(row[3]) if row[3] else {})
+                metadata.update(
+                    {
+                        "db_chunk_id": row[0],
+                        "chunk_id": row[2],
+                        "doc_id": row[4],
+                        "source_path": row[5] or "",
+                        "filename": row[6] or "document",
+                        "collection": row[7] or "general",
+                    }
+                )
+                chunks.append({"content": row[1] or "", "metadata": metadata})
+            return chunks
+        except Exception as exc:
+            logger.error("list_indexed_chunks failed: %s", exc)
+            return []
+
     def save_chat_message(
         self,
         chat_title: str,
@@ -580,7 +637,10 @@ class SecondBrainRepository:
                     "sources": metadata.get("sources", []),
                     "graph_sources": metadata.get("graph_sources", []),
                     "memory_hits": metadata.get("memory_hits", []),
+                    "memory_sources": metadata.get("memory_sources", []),
                     "provenance": metadata.get("provenance", []),
+                    "citation_map": metadata.get("citation_map", {}),
+                    "retrieval_metrics": metadata.get("retrieval_metrics", {}),
                     "external_sources": metadata.get("external_sources", []),
                     "response_time": metadata.get("response_time", 0.0),
                     "cached": bool(metadata.get("cached", False)),
@@ -616,7 +676,10 @@ class SecondBrainRepository:
             "sources": exchange.get("sources", []),
             "graph_sources": exchange.get("graph_sources", []),
             "memory_hits": exchange.get("memory_hits", []),
+            "memory_sources": exchange.get("memory_sources", []),
             "provenance": exchange.get("provenance", []),
+            "citation_map": exchange.get("citation_map", {}),
+            "retrieval_metrics": exchange.get("retrieval_metrics", {}),
             "external_sources": exchange.get("external_sources", []),
             "response_time": exchange.get("response_time", 0.0),
             "cached": bool(exchange.get("cached", False)),
@@ -1066,6 +1129,632 @@ class SecondBrainRepository:
     # ------------------------------------------------------------------
     # Notes — user-authored Second Brain primitive
     # ------------------------------------------------------------------
+
+    def upsert_memory_artifact(
+        self,
+        artifact_type: str,
+        source_table: str,
+        source_id: Any,
+        title: str,
+        content: str,
+        topic_collection: str = "",
+        tags: Optional[List[str]] = None,
+        confidence: float = 1.0,
+        status: str = "active",
+        source_message_id: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[int]:
+        """Upsert a canonical memory artifact and optional vector embedding."""
+        if not self.enabled:
+            return None
+
+        clean_type = (artifact_type or "").strip().lower()
+        clean_source_table = (source_table or "").strip().lower()
+        clean_source_id = str(source_id or "").strip()
+        clean_title = (title or "").strip()
+        clean_content = (content or "").strip()
+        if not clean_type or not clean_source_table or not clean_source_id:
+            return None
+        if not clean_title and not clean_content:
+            return None
+
+        clean_tags = [t.strip() for t in (tags or []) if t and t.strip()]
+        clean_status = (status or "active").strip().lower() or "active"
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_artifacts(
+                            artifact_type, source_table, source_id, title, content,
+                            topic_collection, tags, confidence, status, source_message_id,
+                            metadata_json, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT(artifact_type, source_table, source_id)
+                        DO UPDATE SET
+                            title = EXCLUDED.title,
+                            content = EXCLUDED.content,
+                            topic_collection = EXCLUDED.topic_collection,
+                            tags = EXCLUDED.tags,
+                            confidence = EXCLUDED.confidence,
+                            status = EXCLUDED.status,
+                            source_message_id = EXCLUDED.source_message_id,
+                            metadata_json = EXCLUDED.metadata_json,
+                            updated_at = NOW()
+                        RETURNING id;
+                        """,
+                        (
+                            clean_type,
+                            clean_source_table,
+                            clean_source_id,
+                            clean_title,
+                            clean_content,
+                            (topic_collection or "").strip(),
+                            clean_tags,
+                            float(confidence),
+                            clean_status,
+                            source_message_id,
+                            json.dumps(metadata or {}, ensure_ascii=False),
+                        ),
+                    )
+                    row = cur.fetchone()
+                    artifact_id = int(row[0]) if row else None
+                    if artifact_id is not None and embedding is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO memory_artifact_embeddings(artifact_id, embedding, created_at)
+                            VALUES (%s, %s::vector, NOW())
+                            ON CONFLICT(artifact_id) DO UPDATE SET
+                                embedding = EXCLUDED.embedding,
+                                created_at = NOW();
+                            """,
+                            (artifact_id, _vector_literal(embedding)),
+                        )
+                conn.commit()
+            return artifact_id
+        except Exception as exc:
+            logger.error("upsert_memory_artifact failed: %s", exc)
+            return None
+
+    def delete_memory_artifact(
+        self,
+        artifact_id: Optional[int] = None,
+        artifact_type: Optional[str] = None,
+        source_table: Optional[str] = None,
+        source_id: Optional[Any] = None,
+    ) -> bool:
+        """Delete a memory artifact by id or by source triple."""
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    if artifact_id is not None:
+                        cur.execute("DELETE FROM memory_artifacts WHERE id = %s;", (int(artifact_id),))
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM memory_artifacts
+                            WHERE artifact_type = %s
+                              AND source_table = %s
+                              AND source_id = %s;
+                            """,
+                            (
+                                (artifact_type or "").strip().lower(),
+                                (source_table or "").strip().lower(),
+                                str(source_id or "").strip(),
+                            ),
+                        )
+                    deleted = cur.rowcount > 0
+                conn.commit()
+            return deleted
+        except Exception as exc:
+            logger.error("delete_memory_artifact failed: %s", exc)
+            return False
+
+    def vector_search_memory(
+        self,
+        query_embedding: List[float],
+        topic_collection: Optional[str] = None,
+        artifact_types: Optional[List[str]] = None,
+        top_k: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Cosine-similarity search over all canonical memory artifacts."""
+        if not self.enabled:
+            return []
+
+        clauses = ["ma.status = 'active'"]
+        params: List[Any] = []
+        if topic_collection is not None:
+            clauses.append("ma.topic_collection = %s")
+            params.append((topic_collection or "").strip())
+        if artifact_types:
+            clean_types = [t.strip().lower() for t in artifact_types if t and t.strip()]
+            if clean_types:
+                clauses.append("ma.artifact_type = ANY(%s)")
+                params.append(clean_types)
+
+        vector_sql = _vector_literal(query_embedding)
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT
+                            ma.id, ma.artifact_type, ma.source_table, ma.source_id,
+                            ma.title, ma.content, ma.topic_collection, ma.tags,
+                            ma.confidence, ma.status, ma.source_message_id,
+                            ma.metadata_json, ma.created_at, ma.updated_at,
+                            (1 - (mae.embedding <=> %s::vector)) AS similarity
+                        FROM memory_artifact_embeddings mae
+                        JOIN memory_artifacts ma ON ma.id = mae.artifact_id
+                        WHERE {' AND '.join(clauses)}
+                        ORDER BY mae.embedding <=> %s::vector
+                        LIMIT %s;
+                        """,
+                        (vector_sql, *params, vector_sql, int(top_k)),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [self._memory_artifact_row_to_dict(row, include_similarity=True) for row in rows]
+        except Exception as exc:
+            logger.error("vector_search_memory failed: %s", exc)
+            return []
+
+    def list_memory_artifacts(
+        self,
+        artifact_type: Optional[str] = None,
+        topic_collection: Optional[str] = None,
+        status: str = "active",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+
+        clauses: List[str] = []
+        params: List[Any] = []
+        if status:
+            clauses.append("status = %s")
+            params.append(status.strip().lower())
+        if artifact_type:
+            clauses.append("artifact_type = %s")
+            params.append(artifact_type.strip().lower())
+        if topic_collection is not None:
+            clauses.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, artifact_type, source_table, source_id, title, content,
+                               topic_collection, tags, confidence, status, source_message_id,
+                               metadata_json, created_at, updated_at
+                        FROM memory_artifacts
+                        {where}
+                        ORDER BY updated_at DESC, id DESC
+                        LIMIT %s;
+                        """,
+                        tuple(params),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [self._memory_artifact_row_to_dict(row) for row in rows]
+        except Exception as exc:
+            logger.error("list_memory_artifacts failed: %s", exc)
+            return []
+
+    def list_memory_backfill_candidates(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Return existing notes/tasks/decisions/preferences/messages missing canonical artifacts."""
+        if not self.enabled:
+            return []
+
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        WITH candidates AS (
+                            SELECT 'note' AS artifact_type, 'notes' AS source_table, n.id::text AS source_id,
+                                   COALESCE(NULLIF(n.title, ''), 'Nota #' || n.id::text) AS title,
+                                   n.content AS content, n.topic_collection, n.tags,
+                                   1.0::double precision AS confidence, 'active' AS status,
+                                   NULL::bigint AS source_message_id,
+                                   jsonb_build_object('note_id', n.id) AS metadata_json,
+                                   n.created_at AS created_at, n.updated_at AS updated_at,
+                                   'note_created' AS event_type
+                            FROM notes n
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM memory_artifacts ma
+                                WHERE ma.artifact_type = 'note'
+                                  AND ma.source_table = 'notes'
+                                  AND ma.source_id = n.id::text
+                            )
+
+                            UNION ALL
+                            SELECT 'task', 'tasks', t.id::text, t.title,
+                                   trim(t.title || E'\n\n' || COALESCE(t.details, '') || E'\nStatus: ' || t.status || '; Prioritate: ' || t.priority),
+                                   t.topic_collection, ARRAY[]::text[], t.confidence, t.status,
+                                   t.source_message_id,
+                                   jsonb_build_object('task_id', t.id, 'priority', t.priority, 'due_at', t.due_at),
+                                   t.created_at, t.updated_at, 'task_created'
+                            FROM tasks t
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM memory_artifacts ma
+                                WHERE ma.artifact_type = 'task'
+                                  AND ma.source_table = 'tasks'
+                                  AND ma.source_id = t.id::text
+                            )
+
+                            UNION ALL
+                            SELECT 'decision', 'decisions', d.id::text, d.title, d.rationale,
+                                   d.topic_collection, ARRAY[]::text[], d.confidence, 'active',
+                                   d.source_message_id,
+                                   jsonb_build_object('decision_id', d.id),
+                                   d.created_at, d.created_at, 'decision'
+                            FROM decisions d
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM memory_artifacts ma
+                                WHERE ma.artifact_type = 'decision'
+                                  AND ma.source_table = 'decisions'
+                                  AND ma.source_id = d.id::text
+                            )
+
+                            UNION ALL
+                            SELECT 'preference', 'preferences', p.id::text,
+                                   'Preferinta: ' || p.preference_key,
+                                   p.preference_value, p.topic_collection, ARRAY[]::text[],
+                                   p.confidence, 'active', p.source_message_id,
+                                   jsonb_build_object('preference_id', p.id, 'preference_key', p.preference_key),
+                                   p.created_at, p.updated_at, 'preference_updated'
+                            FROM preferences p
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM memory_artifacts ma
+                                WHERE ma.artifact_type = 'preference'
+                                  AND ma.source_table = 'preferences'
+                                  AND ma.source_id = p.id::text
+                            )
+
+                            UNION ALL
+                            SELECT 'episode', 'messages', m.id::text,
+                                   COALESCE(NULLIF(m.sources_json->>'question', ''), 'Episod conversatie #' || m.id::text),
+                                   trim('Intrebare: ' || COALESCE(m.sources_json->>'question', '') || E'\n\nRaspuns: ' || m.content),
+                                   c.topic_collection, ARRAY[]::text[],
+                                   0.6::double precision, 'active', m.id,
+                                   jsonb_build_object('message_id', m.id, 'chat_id', c.id, 'question', m.sources_json->>'question'),
+                                   m.created_at, m.created_at, 'episode_captured'
+                            FROM messages m
+                            JOIN chats c ON c.id = m.chat_id
+                            WHERE m.role = 'assistant'
+                              AND length(trim(m.content)) > 0
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM memory_artifacts ma
+                                  WHERE ma.artifact_type = 'episode'
+                                    AND ma.source_table = 'messages'
+                                    AND ma.source_id = m.id::text
+                              )
+                        )
+                        SELECT artifact_type, source_table, source_id, title, content,
+                               topic_collection, tags, confidence, status, source_message_id,
+                               metadata_json, created_at, updated_at, event_type
+                        FROM candidates
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        (int(limit),),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+
+            candidates: List[Dict[str, Any]] = []
+            for row in rows:
+                metadata = row[10] if isinstance(row[10], dict) else (json.loads(row[10]) if row[10] else {})
+                candidates.append(
+                    {
+                        "artifact_type": row[0],
+                        "source_table": row[1],
+                        "source_id": row[2],
+                        "title": row[3] or "",
+                        "content": row[4] or "",
+                        "topic_collection": row[5] or "",
+                        "tags": list(row[6] or []),
+                        "confidence": float(row[7] or 0.0),
+                        "status": row[8] or "active",
+                        "source_message_id": int(row[9]) if row[9] is not None else None,
+                        "metadata": metadata,
+                        "created_at": self._iso(row[11]),
+                        "updated_at": self._iso(row[12]),
+                        "event_type": row[13] or "",
+                    }
+                )
+            return candidates
+        except Exception as exc:
+            logger.error("list_memory_backfill_candidates failed: %s", exc)
+            return []
+
+    def get_memory_artifact_counts(self) -> Dict[str, int]:
+        if not self.enabled:
+            return {}
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return {}
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT artifact_type, COUNT(*)
+                        FROM memory_artifacts
+                        GROUP BY artifact_type;
+                        """
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return {str(row[0]): int(row[1] or 0) for row in rows}
+        except Exception as exc:
+            logger.error("get_memory_artifact_counts failed: %s", exc)
+            return {}
+
+    def create_memory_event(
+        self,
+        event_type: str,
+        artifact_type: str = "",
+        artifact_id: Optional[int] = None,
+        topic_collection: str = "",
+        title: str = "",
+        preview: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        occurred_at: Optional[str] = None,
+    ) -> Optional[int]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_events(
+                            event_type, artifact_type, artifact_id, topic_collection,
+                            title, preview, metadata_json, occurred_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, COALESCE(%s::timestamptz, NOW()))
+                        RETURNING id;
+                        """,
+                        (
+                            (event_type or "").strip(),
+                            (artifact_type or "").strip().lower(),
+                            artifact_id,
+                            (topic_collection or "").strip(),
+                            (title or "").strip(),
+                            (preview or "").strip()[:1000],
+                            json.dumps(metadata or {}, ensure_ascii=False),
+                            occurred_at,
+                        ),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            return int(row[0]) if row else None
+        except Exception as exc:
+            logger.error("create_memory_event failed: %s", exc)
+            return None
+
+    def list_memory_events(
+        self,
+        topic_collection: Optional[str] = None,
+        days: int = 14,
+        event_types: Optional[List[str]] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        clauses = ["occurred_at >= NOW() - (%s || ' days')::INTERVAL"]
+        params: List[Any] = [int(days)]
+        if topic_collection is not None:
+            clauses.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+        if event_types:
+            clean_types = [t for t in event_types if t]
+            if clean_types:
+                clauses.append("event_type = ANY(%s)")
+                params.append(clean_types)
+        params.append(int(limit))
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, event_type, artifact_type, artifact_id, topic_collection,
+                               title, preview, metadata_json, occurred_at
+                        FROM memory_events
+                        WHERE {' AND '.join(clauses)}
+                        ORDER BY occurred_at DESC, id DESC
+                        LIMIT %s;
+                        """,
+                        tuple(params),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "type": row[1] or "",
+                    "artifact_type": row[2] or "",
+                    "artifact_id": int(row[3]) if row[3] is not None else None,
+                    "topic_collection": row[4] or "",
+                    "title": row[5] or "",
+                    "preview": row[6] or "",
+                    "metadata": row[7] if isinstance(row[7], dict) else (json.loads(row[7]) if row[7] else {}),
+                    "timestamp": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_memory_events failed: %s", exc)
+            return []
+
+    def create_memory_proposal(
+        self,
+        proposal_type: str,
+        payload: Dict[str, Any],
+        confidence: float,
+        topic_collection: str = "",
+        source_message_id: Optional[int] = None,
+    ) -> Optional[int]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_proposals(
+                            proposal_type, payload_json, confidence, status,
+                            source_message_id, topic_collection, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, 'pending', %s, %s, NOW(), NOW())
+                        RETURNING id;
+                        """,
+                        (
+                            (proposal_type or "").strip().lower(),
+                            json.dumps(payload or {}, ensure_ascii=False),
+                            float(confidence),
+                            source_message_id,
+                            (topic_collection or "").strip(),
+                        ),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            return int(row[0]) if row else None
+        except Exception as exc:
+            logger.error("create_memory_proposal failed: %s", exc)
+            return None
+
+    def list_memory_proposals(
+        self,
+        status: str = "pending",
+        topic_collection: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        clauses: List[str] = []
+        params: List[Any] = []
+        if status:
+            clauses.append("status = %s")
+            params.append(status.strip().lower())
+        if topic_collection is not None:
+            clauses.append("topic_collection = %s")
+            params.append((topic_collection or "").strip())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, proposal_type, payload_json, confidence, status,
+                               source_message_id, topic_collection, created_at, updated_at, resolved_at
+                        FROM memory_proposals
+                        {where}
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT %s;
+                        """,
+                        tuple(params),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            proposals: List[Dict[str, Any]] = []
+            for row in rows:
+                payload = row[2] if isinstance(row[2], dict) else (json.loads(row[2]) if row[2] else {})
+                proposals.append(
+                    {
+                        "id": int(row[0]),
+                        "proposal_type": row[1] or "",
+                        "payload": payload,
+                        "confidence": float(row[3] or 0.0),
+                        "status": row[4] or "",
+                        "source_message_id": int(row[5]) if row[5] is not None else None,
+                        "topic_collection": row[6] or "",
+                        "created_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+                        "updated_at": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+                        "resolved_at": row[9].isoformat() if hasattr(row[9], "isoformat") else (str(row[9]) if row[9] else None),
+                    }
+                )
+            return proposals
+        except Exception as exc:
+            logger.error("list_memory_proposals failed: %s", exc)
+            return []
+
+    def resolve_memory_proposal(self, proposal_id: int, status: str) -> bool:
+        if not self.enabled:
+            return False
+        clean_status = (status or "").strip().lower()
+        if clean_status not in {"accepted", "dismissed"}:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE memory_proposals
+                        SET status = %s, updated_at = NOW(), resolved_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (clean_status, int(proposal_id)),
+                    )
+                    updated = cur.rowcount > 0
+                conn.commit()
+            return updated
+        except Exception as exc:
+            logger.error("resolve_memory_proposal failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _memory_artifact_row_to_dict(row: Any, include_similarity: bool = False) -> Dict[str, Any]:
+        base = {
+            "id": int(row[0]),
+            "artifact_type": row[1] or "",
+            "source_table": row[2] or "",
+            "source_id": row[3] or "",
+            "title": row[4] or "",
+            "content": row[5] or "",
+            "topic_collection": row[6] or "",
+            "tags": list(row[7] or []),
+            "confidence": float(row[8] or 0.0),
+            "status": row[9] or "",
+            "source_message_id": int(row[10]) if row[10] is not None else None,
+            "metadata": row[11] if isinstance(row[11], dict) else (json.loads(row[11]) if row[11] else {}),
+            "created_at": row[12].isoformat() if hasattr(row[12], "isoformat") else str(row[12]),
+            "updated_at": row[13].isoformat() if hasattr(row[13], "isoformat") else str(row[13]),
+        }
+        if include_similarity:
+            base["similarity"] = float(row[14] or 0.0)
+        return base
 
     def create_note(
         self,
@@ -1549,6 +2238,43 @@ class SecondBrainRepository:
             logger.error("update_task failed: %s", exc)
             return False
 
+    def get_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, details, topic_collection, status, priority,
+                               due_at, confidence, created_at, updated_at
+                        FROM tasks
+                        WHERE id = %s;
+                        """,
+                        (int(task_id),),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "title": row[1],
+                "details": row[2] or "",
+                "topic_collection": row[3] or "",
+                "status": row[4] or "open",
+                "priority": row[5] or "normal",
+                "due_at": row[6].isoformat() if hasattr(row[6], "isoformat") else (str(row[6]) if row[6] else None),
+                "confidence": float(row[7] or 0.0),
+                "created_at": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+                "updated_at": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+            }
+        except Exception as exc:
+            logger.error("get_task failed: %s", exc)
+            return None
+
     def delete_task(self, task_id: int) -> bool:
         if not self.enabled:
             return False
@@ -1772,6 +2498,38 @@ class SecondBrainRepository:
             logger.error("update_decision failed: %s", exc)
             return False
 
+    def get_decision(self, decision_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, title, rationale, topic_collection, confidence, created_at
+                        FROM decisions
+                        WHERE id = %s;
+                        """,
+                        (int(decision_id),),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "title": row[1] or "",
+                "rationale": row[2] or "",
+                "topic_collection": row[3] or "",
+                "confidence": float(row[4] or 0.0),
+                "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+            }
+        except Exception as exc:
+            logger.error("get_decision failed: %s", exc)
+            return None
+
     def delete_decision(self, decision_id: int) -> bool:
         if not self.enabled:
             return False
@@ -1887,6 +2645,38 @@ class SecondBrainRepository:
         except Exception as exc:
             logger.error("update_preference failed: %s", exc)
             return False
+
+    def get_preference(self, preference_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, preference_key, preference_value, topic_collection, confidence, updated_at
+                        FROM preferences
+                        WHERE id = %s;
+                        """,
+                        (int(preference_id),),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "preference_key": row[1] or "",
+                "preference_value": row[2] or "",
+                "topic_collection": row[3] or "",
+                "confidence": float(row[4] or 0.0),
+                "updated_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+            }
+        except Exception as exc:
+            logger.error("get_preference failed: %s", exc)
+            return None
 
     def delete_preference(self, preference_id: int) -> bool:
         if not self.enabled:
