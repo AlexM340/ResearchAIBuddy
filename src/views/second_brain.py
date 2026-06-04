@@ -406,16 +406,16 @@ def _render_contradictions(apci_system) -> None:
 
         if active:
             st.warning(f"{len(active)} contradictii active.")
-            for item in active:
-                _render_contradiction_card(apci_system, item, dismissed=False)
+            for idx, item in enumerate(active):
+                _render_contradiction_card(apci_system, item, dismissed=False, card_index=idx)
 
         if dismissed and include_dismissed:
             st.caption(f"{len(dismissed)} contradictii dismissed (rezolvate manual).")
-            for item in dismissed:
-                _render_contradiction_card(apci_system, item, dismissed=True)
+            for idx, item in enumerate(dismissed):
+                _render_contradiction_card(apci_system, item, dismissed=True, card_index=idx)
 
 
-def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: bool) -> None:
+def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: bool, card_index: int) -> None:
     source = item.get("source", "?")
     target = item.get("target", "?")
     topic = item.get("topic", "general")
@@ -435,7 +435,7 @@ def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: boo
         if dismissed:
             if st.button(
                 "Restaureaza",
-                key=f"contr_restore_{source}_{target}",
+                key=f"contr_restore_{card_index}_{source}_{target}",
                 use_container_width=True,
             ):
                 if apci_system.restore_contradiction(source=source, target=target):
@@ -445,7 +445,7 @@ def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: boo
         else:
             if st.button(
                 "Dismiss (rezolvat manual)",
-                key=f"contr_dismiss_{source}_{target}",
+                key=f"contr_dismiss_{card_index}_{source}_{target}",
                 use_container_width=True,
             ):
                 if apci_system.dismiss_contradiction(source=source, target=target):

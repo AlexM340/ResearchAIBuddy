@@ -675,10 +675,10 @@ def main_interface() -> None:
     pages = [
         st.Page(render_second_brain, title="Second Brain", icon="🧠",
                 url_path="second-brain", default=True),
-        st.Page(render_notes, title="Notes", icon="💡",
-                url_path="notes"),
         st.Page(render_notebooks, title="Notebooks", icon="📚",
                 url_path="notebooks"),
+        st.Page(render_notes, title="Notes", icon="💡",
+                url_path="notes"),
         st.Page(render_tasks, title="Tasks", icon="✅",
                 url_path="tasks"),
         st.Page(render_timeline, title="Timeline", icon="📅",
