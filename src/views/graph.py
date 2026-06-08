@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+from views import _cache
+
 RELATION_COLORS = {
     "RELATED_TO": "#6c8ebf",
     "DEPENDS_ON": "#82b366",
@@ -124,10 +126,11 @@ def _render_graph_controls(apci_system) -> None:
     )
 
     with st.spinner("Se incarca graful..."):
-        viz_data = apci_system.get_graph_viz_data(
-            limit_nodes=limit,
-            relation_types=active_relations,
-            collection_filter=collection_filter,
+        viz_data = _cache.graph_viz(
+            apci_system,
+            limit,
+            tuple(active_relations),
+            collection_filter,
         )
 
     nodes = viz_data.get("nodes", [])
@@ -173,10 +176,11 @@ def render_mini_graph(collection_filter: str) -> None:
     active_relations = selected_relations or ALL_RELATION_TYPES
 
     with st.spinner("Se incarca graful..."):
-        viz_data = apci_system.get_graph_viz_data(
-            limit_nodes=limit,
-            relation_types=active_relations,
-            collection_filter=collection_filter,
+        viz_data = _cache.graph_viz(
+            apci_system,
+            limit,
+            tuple(active_relations),
+            collection_filter,
         )
 
     nodes = viz_data.get("nodes", [])

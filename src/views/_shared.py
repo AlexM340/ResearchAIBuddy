@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+from views import _cache
+from views._cache import invalidate_reads
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -89,16 +92,27 @@ def build_metadata_entry(doc_id: str, doc_info: Dict[str, Any], file_path: Path)
 # ---------------------------------------------------------------------------
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _repository_healthy(_repository) -> bool:
+    """Memoize the DB liveness probe so it doesn't run on every render.
+
+    get_chat_manager() is called several times per rerun; without this each
+    call ran test_connection() (SELECT 1 + pg_extension probe). A short TTL
+    keeps the probe fresh while collapsing a burst of reruns into one check.
+    """
+    try:
+        return bool(_repository.is_healthy())
+    except Exception:
+        return False
+
+
 def get_chat_manager():
     """Returneaza chat manager-ul DB cand storage e healthy, altfel cel local."""
     apci_system = st.session_state.get("apci_system")
     repository = getattr(apci_system, "repository", None) if apci_system else None
     if repository and getattr(repository, "enabled", False):
-        try:
-            if repository.is_healthy():
-                return repository
-        except Exception:
-            pass
+        if _repository_healthy(repository):
+            return repository
 
     return st.session_state.get("chat_manager")
 
@@ -128,7 +142,7 @@ def _list_sessions_for_scope(manager, topic_collection: Optional[str]) -> List[D
     - topic_collection == "" sau None  -> Second Brain (chat-uri globale)
     - topic_collection == "Nume"        -> Notebook (chat-uri pe acel notebook)
     """
-    sessions = manager.list_sessions()
+    sessions = _cache.chat_sessions(manager, type(manager).__name__)
     target = (topic_collection or "").strip()
     if target:
         return [s for s in sessions if (s.get("topic_collection") or "").strip() == target]
@@ -152,10 +166,14 @@ def ensure_active_chat_for_scope(
     scope_ids = {s["id"] for s in scope_sessions}
 
     if active_chat_id in scope_ids:
-        # chat-ul curent e deja in scope, doar reincarca starea
+        # Chat-ul curent e deja in scope. Daca starea lui e deja in session_state
+        # (incarcata anterior), nu mai re-citim mesajele din DB la fiecare rerun.
+        if st.session_state.get("_loaded_chat_id") == active_chat_id:
+            return active_chat_id
         active_session = manager.load_session(active_chat_id) or {}
         st.session_state.chat_history = active_session.get("messages", [])
         st.session_state.chat_title_draft = active_session.get("title", DEFAULT_CHAT_TITLE)
+        st.session_state._loaded_chat_id = active_chat_id
         return active_chat_id
 
     if scope_sessions:
@@ -164,6 +182,7 @@ def ensure_active_chat_for_scope(
         loaded = manager.load_session(latest["id"]) or {}
         st.session_state.chat_history = loaded.get("messages", [])
         st.session_state.chat_title_draft = loaded.get("title", DEFAULT_CHAT_TITLE)
+        st.session_state._loaded_chat_id = latest["id"]
         return latest["id"]
 
     # nici un chat in scope -> creeaza unul nou
@@ -177,6 +196,8 @@ def ensure_active_chat_for_scope(
     st.session_state.active_chat_id = created["id"]
     st.session_state.chat_history = []
     st.session_state.chat_title_draft = created.get("title", DEFAULT_CHAT_TITLE)
+    st.session_state._loaded_chat_id = created["id"]
+    invalidate_reads()  # new session must appear in the cached session list
     return created["id"]
 
 
@@ -193,6 +214,7 @@ def switch_active_chat(session_id: str) -> None:
     st.session_state.active_chat_id = session_id
     st.session_state.chat_history = session_data.get("messages", [])
     st.session_state.chat_title_draft = session_data.get("title", DEFAULT_CHAT_TITLE)
+    st.session_state._loaded_chat_id = session_id
 
 
 def create_chat_in_scope(
@@ -211,6 +233,7 @@ def create_chat_in_scope(
     )
     if not created or not created.get("id"):
         return None
+    invalidate_reads()  # refresh cached session list with the new chat
     switch_active_chat(created["id"])
     return created["id"]
 
@@ -225,6 +248,8 @@ def delete_active_chat(topic_collection: Optional[str], default_query_mode: str)
         return
     manager.delete_session(active_chat_id)
     st.session_state.active_chat_id = ""
+    st.session_state.pop("_loaded_chat_id", None)
+    invalidate_reads()  # drop deleted chat before re-resolving the active one
     ensure_active_chat_for_scope(topic_collection, default_query_mode)
 
 
@@ -235,6 +260,7 @@ def clear_active_chat() -> None:
     st.session_state.chat_history = []
     if manager and active_chat_id:
         manager.clear_session(active_chat_id)
+        invalidate_reads()  # message_count changed
 
 
 def rename_active_chat(new_title: str) -> bool:
@@ -245,6 +271,7 @@ def rename_active_chat(new_title: str) -> bool:
         return False
     manager.rename_session(active_chat_id, new_title.strip())
     st.session_state.chat_title_draft = new_title.strip()
+    invalidate_reads()  # title changed in the session list
     return True
 
 
@@ -322,6 +349,11 @@ def process_question(
                 query_mode=retrieval_mode,
             )
             st.session_state.chat_title_draft = persisted.get("title", DEFAULT_CHAT_TITLE)
+
+        # A query may persist new memory (decisions/tasks/preferences/episodes)
+        # and changes the active chat's message count, so drop cached reads to
+        # keep insights and the session list fresh on the next render.
+        invalidate_reads()
 
         st.rerun()
     except Exception as exc:

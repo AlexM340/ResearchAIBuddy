@@ -73,6 +73,7 @@ except ImportError as exc:
     CHAT_SESSION_MANAGER_AVAILABLE = False
     st.error(f"Chat Session Manager nu este disponibil: {exc}")
 
+from views import _cache
 from views._documents import run_full_reindex, sync_library_to_db, update_system_status
 from views._shared import (
     DEFAULT_CHAT_TITLE,
@@ -431,68 +432,83 @@ def check_api_key_setup() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def setup_sidebar() -> None:
-    """Bara laterala minimalista: status sistem + utilitare avansate."""
+def render_sidebar_brand() -> None:
+    """Antetul barei laterale (sus de tot, inainte de continutul paginii)."""
     with st.sidebar:
-        st.markdown("### CerebrumAI")
+        st.markdown("### 🧠 CerebrumAI")
         st.caption("Asistent personalizat de cercetare si invatare")
+
+
+def render_sidebar_global() -> None:
+    """Utilitare globale + status + setari, sub sectiunea specifica paginii.
+
+    Se randeaza DUPA pagina, ca sectiunile paginii (ex. Chat/Unelte din Second
+    Brain) sa apara sus, iar plumbing-ul (status, setari, intretinere) jos.
+    """
+    with st.sidebar:
         st.divider()
-
-        _render_status_section()
         _render_quick_actions()
+        st.divider()
+        _render_status_pill()
+        with st.expander("⚙️ Setari", expanded=False):
+            _render_settings_section()
+        with st.expander("🔧 Zona tehnica", expanded=False):
+            st.caption("Operatii de intretinere — pot dura sau rescrie indexul. Foloseste cu grija.")
+            _render_maintenance_section()
 
-        with st.expander("Setari avansate", expanded=False):
-            _render_advanced_section()
 
-
-def _render_status_section() -> None:
+def _render_status_pill() -> None:
+    """Status condensat: o pastila de sanatate + avertismente; detalii la cerere."""
     summary = st.session_state.get("last_sync_summary", {}) or {}
     apci_system = st.session_state.get("apci_system")
 
     postgres_ok = False
     neo4j_ok = False
+    web_search_ok = False
+    storage_status: Dict[str, Any] = {}
     if apci_system:
         try:
-            storage_status = apci_system.get_storage_index_status() or {}
+            # Cached: fans out to 3 DB queries; partajat cu restul sidebar-ului.
+            storage_status = _cache.storage_index_status(apci_system) or {}
             postgres_ok = bool(storage_status.get("postgres_enabled", False))
         except Exception:
-            postgres_ok = False
+            storage_status = {}
         neo4j_client = getattr(apci_system, "neo4j_client", None)
         neo4j_ok = bool(neo4j_client and getattr(neo4j_client, "enabled", False))
-
-    web_search_ok = False
-    if apci_system:
         try:
             web_search_ok = bool(getattr(apci_system, "web_search_available", False))
         except Exception:
             web_search_ok = False
 
-    st.markdown("**Status**")
-    st.caption(f"Postgres + pgvector: {'conectat' if postgres_ok else 'indisponibil (local fallback)'}")
-    st.caption(f"Neo4j (graph): {'conectat' if neo4j_ok else 'indisponibil'}")
-    st.caption(f"Tavily (web search): {'conectat' if web_search_ok else 'indisponibil (TAVILY_API_KEY lipsa)'}")
-    if postgres_ok and apci_system:
-        try:
-            storage_status = apci_system.get_storage_index_status() or {}
-            migrations = storage_status.get("migrations", {}) or {}
-            pending = migrations.get("pending") or []
-            if pending:
-                st.warning(f"Migratii DB pending: {len(pending)}")
-            counts = storage_status.get("memory_artifact_counts", {}) or {}
-            if counts:
-                st.caption(f"Memory artifacts: {sum(int(v or 0) for v in counts.values())}")
-        except Exception:
-            pass
+    migrations = (storage_status.get("migrations") or {}) if storage_status else {}
+    pending = migrations.get("pending") or []
+
+    # Pastila de sanatate (o singura linie).
+    if postgres_ok:
+        st.caption("🟢 Conectat")
+    else:
+        st.caption("🟡 Mod local (fara Postgres)")
+
+    # Avertismentele actionabile raman vizibile.
     if not postgres_ok:
         st.warning("Mod limitat: Second Brain complet necesita Postgres + pgvector.")
+    if pending:
+        st.warning(f"Migratii DB pending: {len(pending)} — vezi 🔧 Zona tehnica.")
 
-    indexed_docs = int(summary.get("indexed_documents", 0) or 0)
-    indexed_chunks = int(summary.get("indexed_chunks", 0) or 0)
-    st.caption(f"Documente indexate: {indexed_docs} ({indexed_chunks} chunks)")
-    last_sync = summary.get("last_sync_at")
-    if last_sync:
-        st.caption(f"Ultimul sync: {last_sync}")
-    st.divider()
+    # Detaliile tehnice, la cerere.
+    with st.expander("Detalii sistem", expanded=False):
+        st.caption(f"Postgres + pgvector: {'conectat' if postgres_ok else 'indisponibil (local fallback)'}")
+        st.caption(f"Neo4j (graph): {'conectat' if neo4j_ok else 'indisponibil'}")
+        st.caption(f"Tavily (web search): {'conectat' if web_search_ok else 'indisponibil (TAVILY_API_KEY lipsa)'}")
+        counts = (storage_status.get("memory_artifact_counts") or {}) if storage_status else {}
+        if counts:
+            st.caption(f"Memory artifacts: {sum(int(v or 0) for v in counts.values())}")
+        indexed_docs = int(summary.get("indexed_documents", 0) or 0)
+        indexed_chunks = int(summary.get("indexed_chunks", 0) or 0)
+        st.caption(f"Documente indexate: {indexed_docs} ({indexed_chunks} chunks)")
+        last_sync = summary.get("last_sync_at")
+        if last_sync:
+            st.caption(f"Ultimul sync: {last_sync}")
 
 
 def _render_quick_actions() -> None:
@@ -564,7 +580,56 @@ def _render_quick_note_capture() -> None:
                     st.switch_page(notes_page)
 
 
-def _render_advanced_section() -> None:
+def _render_settings_section() -> None:
+    """Setari user-facing: web search implicit, cache, cheia API."""
+    apci_system = st.session_state.get("apci_system")
+    if not apci_system:
+        st.caption("Sistemul nu este initializat.")
+        return
+
+    # Web fallback implicit (diferit de 'Forteaza web' din chat).
+    st.markdown("**Web search (Tavily)**")
+    current = bool(getattr(apci_system.config, "enable_web_fallback", True))
+    new_value = st.toggle(
+        "Auto web search cand lipseste context intern",
+        value=current,
+        key="sidebar_web_fallback_toggle",
+        help="Comportamentul implicit. 'Forteaza web' din chat tine doar de urmatoarea intrebare.",
+    )
+    if new_value != current:
+        try:
+            apci_system.config.enable_web_fallback = bool(new_value)
+            st.success("Setare actualizata.")
+        except Exception:
+            st.error("Nu am putut actualiza setarea.")
+
+    # Cache embeddings.
+    try:
+        cache_info = apci_system.get_cache_info() or {}
+        embeddings_cache = cache_info.get("embeddings_cache") or {}
+        if embeddings_cache:
+            st.divider()
+            st.caption(
+                f"Cache embeddings: {embeddings_cache.get('cached_files', 0)} fisiere "
+                f"({embeddings_cache.get('cache_size_mb', 0)} MB)"
+            )
+            if st.button("Curata cache embeddings", use_container_width=True):
+                apci_system.clear_embeddings_cache()
+                st.success("Cache curatat.")
+                st.rerun()
+    except Exception:
+        pass
+
+    # API key (read-only display).
+    current_key = os.getenv("GOOGLE_API_KEY", "")
+    if current_key:
+        masked = current_key[:6] + "…" + current_key[-4:] if len(current_key) > 12 else "configurat"
+        st.divider()
+        st.caption(f"API Key: `{masked}`")
+
+
+def _render_maintenance_section() -> None:
+    """Operatii de intretinere/admin (potential lente sau destructive)."""
     # Migrare chat-uri locale -> Postgres
     chat_manager = get_chat_manager()
     local_manager = get_local_chat_manager()
@@ -582,100 +647,62 @@ def _render_advanced_section() -> None:
                 st.rerun()
             st.divider()
 
-    # Statistici sistem
     apci_system = st.session_state.get("apci_system")
-    if apci_system:
-        try:
-            cache_info = apci_system.get_cache_info() or {}
-            embeddings_cache = cache_info.get("embeddings_cache") or {}
-            if embeddings_cache:
-                st.caption(
-                    f"Cache embeddings: {embeddings_cache.get('cached_files', 0)} fisiere "
-                    f"({embeddings_cache.get('cache_size_mb', 0)} MB)"
-                )
-                if st.button("Curata cache embeddings", use_container_width=True):
-                    apci_system.clear_embeddings_cache()
-                    st.success("Cache curatat.")
-                    st.rerun()
-        except Exception:
-            pass
+    if not apci_system:
+        return
 
-        # Web fallback toggle (P4)
-        if apci_system:
-            st.divider()
-            st.markdown("**Web search (Tavily)**")
-            current = bool(getattr(apci_system.config, "enable_web_fallback", True))
-            new_value = st.toggle(
-                "Activeaza fallback automat pe web cand context intern insuficient",
-                value=current,
-                key="sidebar_web_fallback_toggle",
+    st.markdown("**Memorie canonica**")
+    try:
+        # Cached storage status (evita 3 query-uri DB la fiecare rerun).
+        storage_status = _cache.storage_index_status(apci_system) or {}
+        migrations = storage_status.get("migrations", {}) or {}
+        pending_migrations = migrations.get("pending") or []
+        if pending_migrations:
+            st.warning("Migratii pending: " + ", ".join(pending_migrations))
+            if st.button("Aplica migratiile DB", use_container_width=True, key="sidebar_run_migrations"):
+                repo = getattr(apci_system, "repository", None)
+                ok = bool(repo and hasattr(repo.client, "run_migrations") and repo.client.run_migrations())
+                if ok:
+                    st.success("Migratii aplicate.")
+                else:
+                    st.error("Migratiile nu au putut fi aplicate.")
+                st.rerun()
+        else:
+            st.caption("Schema DB: la zi.")
+    except Exception:
+        pass
+
+    if st.button("Backfill memory artifacts", use_container_width=True, key="sidebar_backfill_memory"):
+        with st.spinner("Construiesc memory_artifacts pentru date existente..."):
+            result = apci_system.backfill_memory_artifacts(limit=1000)
+        if result.get("success"):
+            st.success(f"Backfill: {result.get('created', 0)} artifact-uri create.")
+        else:
+            st.warning(f"Backfill partial: {result}")
+        st.rerun()
+
+    if st.button("Reconstruieste Neo4j din Postgres", use_container_width=True, key="sidebar_rebuild_graph"):
+        with st.spinner("Reconstruiesc proiectia Neo4j..."):
+            result = apci_system.rebuild_graph_projection()
+        if result.get("error"):
+            st.warning(result["error"])
+        else:
+            st.success(
+                f"Graph rebuild: {result.get('chunks', 0)} chunks, "
+                f"{result.get('artifacts', 0)} artifacts, {result.get('relations', 0)} relatii."
             )
-            if new_value != current:
-                try:
-                    apci_system.config.enable_web_fallback = bool(new_value)
-                    st.success("Setare actualizata.")
-                except Exception:
-                    st.error("Nu am putut actualiza setarea.")
+        st.rerun()
 
-        st.divider()
-        st.markdown("**Memorie canonica**")
-        try:
-            storage_status = apci_system.get_storage_index_status() or {}
-            migrations = storage_status.get("migrations", {}) or {}
-            pending_migrations = migrations.get("pending") or []
-            if pending_migrations:
-                st.warning("Migratii pending: " + ", ".join(pending_migrations))
-                if st.button("Aplica migratiile DB", use_container_width=True, key="sidebar_run_migrations"):
-                    repo = getattr(apci_system, "repository", None)
-                    ok = bool(repo and hasattr(repo.client, "run_migrations") and repo.client.run_migrations())
-                    if ok:
-                        st.success("Migratii aplicate.")
-                    else:
-                        st.error("Migratiile nu au putut fi aplicate.")
-                    st.rerun()
-            else:
-                st.caption("Schema DB: la zi.")
-        except Exception:
-            pass
-
-        if st.button("Backfill memory artifacts", use_container_width=True, key="sidebar_backfill_memory"):
-            with st.spinner("Construiesc memory_artifacts pentru date existente..."):
-                result = apci_system.backfill_memory_artifacts(limit=1000)
-            if result.get("success"):
-                st.success(f"Backfill: {result.get('created', 0)} artifact-uri create.")
-            else:
-                st.warning(f"Backfill partial: {result}")
-            st.rerun()
-
-        if st.button("Reconstruieste Neo4j din Postgres", use_container_width=True, key="sidebar_rebuild_graph"):
-            with st.spinner("Reconstruiesc proiectia Neo4j..."):
-                result = apci_system.rebuild_graph_projection()
-            if result.get("error"):
-                st.warning(result["error"])
-            else:
-                st.success(
-                    f"Graph rebuild: {result.get('chunks', 0)} chunks, "
-                    f"{result.get('artifacts', 0)} artifacts, {result.get('relations', 0)} relatii."
-                )
-            st.rerun()
-
-        # Reindexare manuala (disponibila oricand — util dupa schimbari de model/schema)
-        st.divider()
-        st.caption("Reindexare completa: sterge toti vectorii si ii reconstruieste cu modelul curent.")
-        if st.button("Reindexeaza toate documentele", use_container_width=True, key="sidebar_reindex_btn"):
-            with st.spinner("Reindexez... poate dura cateva minute."):
-                result = run_full_reindex()
-            if result.get("success"):
-                st.success(result.get("message", "Reindexare completa."))
-            else:
-                st.error(result.get("message", "Reindexare esuata."))
-            st.rerun()
-
-    # API key (read-only display + reset)
-    current_key = os.getenv("GOOGLE_API_KEY", "")
-    if current_key:
-        masked = current_key[:6] + "…" + current_key[-4:] if len(current_key) > 12 else "configurat"
-        st.caption(f"API Key: `{masked}`")
+    st.divider()
+    st.caption("Reindexare completa: sterge toti vectorii si ii reconstruieste cu modelul curent.")
+    if st.button("Reindexeaza toate documentele", use_container_width=True, key="sidebar_reindex_btn"):
+        with st.spinner("Reindexez... poate dura cateva minute."):
+            result = run_full_reindex()
+        if result.get("success"):
+            st.success(result.get("message", "Reindexare completa."))
+        else:
+            st.error(result.get("message", "Reindexare esuata."))
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +795,10 @@ def main() -> None:
         if not st.session_state.get("startup_bootstrap_done"):
             bootstrap_documents_from_storage(os.getenv("GOOGLE_API_KEY", ""))
 
-        setup_sidebar()
+        # Sidebar: brand sus -> sectiunea paginii (ex. Chat/Unelte) -> utilitare globale jos.
+        render_sidebar_brand()
         main_interface()
+        render_sidebar_global()
     except Exception as exc:
         st.error(f"Eroare critica in aplicatie: {exc}")
         logger.exception("Eroare critica: %s", exc)

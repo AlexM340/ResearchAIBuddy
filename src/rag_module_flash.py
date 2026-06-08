@@ -980,6 +980,97 @@ class SimpleRetriever:
                 self.chunk_lookup[(normalized_source, normalized_chunk_id)] = idx
             except Exception:
                 continue
+
+    @staticmethod
+    def _embedding_count(embeddings: Any) -> int:
+        if embeddings is None:
+            return 0
+        if NUMPY_AVAILABLE and hasattr(embeddings, "shape"):
+            shape = getattr(embeddings, "shape", ())
+            return int(shape[0]) if shape else 0
+        try:
+            return len(embeddings)
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _slice_embeddings(embeddings: Any, indices: List[int]) -> Any:
+        if embeddings is None:
+            return None
+        if not indices:
+            return []
+        if NUMPY_AVAILABLE and hasattr(embeddings, "shape"):
+            return embeddings[indices]
+        return [embeddings[idx] for idx in indices]
+
+    @staticmethod
+    def _concat_embeddings(existing_embeddings: Any, new_embeddings: Any) -> Any:
+        if SimpleRetriever._embedding_count(existing_embeddings) == 0:
+            return new_embeddings
+        if SimpleRetriever._embedding_count(new_embeddings) == 0:
+            return existing_embeddings
+        if NUMPY_AVAILABLE:
+            return np.vstack([existing_embeddings, new_embeddings])
+        existing_list = list(existing_embeddings)
+        existing_list.extend(list(new_embeddings))
+        return existing_list
+
+    def _select_new_docs_with_embeddings(
+        self,
+        docs: List[Dict[str, Any]],
+        embeddings: Any,
+        existing_contents: set,
+    ) -> tuple[List[Dict[str, Any]], Any]:
+        selected_docs: List[Dict[str, Any]] = []
+        selected_indices: List[int] = []
+        for idx, doc in enumerate(docs):
+            if doc.get("content") in existing_contents:
+                continue
+            selected_docs.append(doc)
+            selected_indices.append(idx)
+        return selected_docs, self._slice_embeddings(embeddings, selected_indices)
+
+    def _append_documents_with_embeddings(
+        self,
+        docs: List[Dict[str, Any]],
+        embeddings: Any = None,
+    ) -> None:
+        if not hasattr(self, "documents") or self.documents is None:
+            self.documents = []
+        if not docs:
+            return
+
+        previous_doc_count = len(self.documents)
+        previous_embedding_count = self._embedding_count(self.document_embeddings)
+        new_embedding_count = self._embedding_count(embeddings)
+
+        self.documents.extend(docs)
+
+        if embeddings is None:
+            if previous_embedding_count not in {0, previous_doc_count}:
+                logger.warning("Embedding index already misaligned; disabling semantic in-memory retrieval.")
+                self.document_embeddings = []
+            elif previous_embedding_count and previous_doc_count != len(self.documents):
+                logger.warning("Added documents without embeddings; disabling semantic in-memory retrieval.")
+                self.document_embeddings = []
+            return
+
+        if new_embedding_count != len(docs):
+            logger.warning(
+                "Embedding/doc alignment mismatch (%s embeddings for %s docs); "
+                "disabling semantic in-memory retrieval.",
+                new_embedding_count,
+                len(docs),
+            )
+            self.document_embeddings = []
+            return
+
+        if previous_doc_count and previous_embedding_count != previous_doc_count:
+            logger.warning("Existing embedding index is misaligned; disabling semantic in-memory retrieval.")
+            self.document_embeddings = []
+            return
+
+        self.document_embeddings = self._concat_embeddings(self.document_embeddings, embeddings)
     
     def build_index_with_cache(self, file_paths: List[str], documents: List[Dict[str, Any]]):
         """Construiește indexul cu cache persistent - optimizat pentru viteză"""
@@ -999,21 +1090,14 @@ class SimpleRetriever:
             
             # Verifică pentru duplicate
             existing_contents = {doc['content'] for doc in self.documents} if self.documents else set()
-            new_cached_docs = [doc for doc in cached_docs if doc['content'] not in existing_contents]
+            new_cached_docs, new_cached_embeddings = self._select_new_docs_with_embeddings(
+                cached_docs,
+                cached_embeddings,
+                existing_contents,
+            )
             
             if new_cached_docs:
-                self.documents.extend(new_cached_docs)
-                
-                # Adaugă embeddings din cache
-                if cached_embeddings is not None:
-                    if hasattr(self, 'document_embeddings') and len(self.document_embeddings) > 0:
-                        if NUMPY_AVAILABLE:
-                            self.document_embeddings = np.vstack([self.document_embeddings, cached_embeddings])
-                        else:
-                            self.document_embeddings = np.concatenate([self.document_embeddings, cached_embeddings])
-                    else:
-                        self.document_embeddings = cached_embeddings
-                
+                self._append_documents_with_embeddings(new_cached_docs, new_cached_embeddings)
                 logger.info(f"Încărcat instant din cache: {len(new_cached_docs)} documente")
             else:
                 logger.info("Toate documentele din cache sunt deja încărcate")
@@ -1030,20 +1114,14 @@ class SimpleRetriever:
         # Adaugă documentele din cache mai întâi
         if cached_docs:
             existing_contents = {doc['content'] for doc in self.documents} if self.documents else set()
-            new_cached_docs = [doc for doc in cached_docs if doc['content'] not in existing_contents]
+            new_cached_docs, new_cached_embeddings = self._select_new_docs_with_embeddings(
+                cached_docs,
+                cached_embeddings,
+                existing_contents,
+            )
             
             if new_cached_docs:
-                self.documents.extend(new_cached_docs)
-                
-                if cached_embeddings is not None:
-                    if hasattr(self, 'document_embeddings') and len(self.document_embeddings) > 0:
-                        if NUMPY_AVAILABLE:
-                            self.document_embeddings = np.vstack([self.document_embeddings, cached_embeddings])
-                        else:
-                            self.document_embeddings = np.concatenate([self.document_embeddings, cached_embeddings])
-                    else:
-                        self.document_embeddings = cached_embeddings
-                
+                self._append_documents_with_embeddings(new_cached_docs, new_cached_embeddings)
                 logger.info(f"Adăugat din cache: {len(new_cached_docs)} documente")
         
         # Procesează doar documentele noi (care nu sunt în cache)
@@ -1051,7 +1129,6 @@ class SimpleRetriever:
         new_docs = [doc for doc in documents if doc['content'] not in existing_contents]
         
         if new_docs:
-            self.documents.extend(new_docs)
             logger.info(f"Procesez {len(new_docs)} documente noi")
             
             # Generează embeddings doar pentru documentele noi
@@ -1061,13 +1138,7 @@ class SimpleRetriever:
                     new_embeddings = self.embeddings_model.encode(new_contents)
                     
                     # Concatenează cu embeddings existente
-                    if hasattr(self, 'document_embeddings') and len(self.document_embeddings) > 0:
-                        if NUMPY_AVAILABLE:
-                            self.document_embeddings = np.vstack([self.document_embeddings, new_embeddings])
-                        else:
-                            self.document_embeddings = np.concatenate([self.document_embeddings, new_embeddings])
-                    else:
-                        self.document_embeddings = new_embeddings
+                    self._append_documents_with_embeddings(new_docs, new_embeddings)
                     
                     logger.info(f"Generat embeddings pentru {len(new_docs)} documente noi")
                     
@@ -1076,7 +1147,13 @@ class SimpleRetriever:
                     
                 except Exception as e:
                     logger.error(f"Eroare la generarea embeddings: {e}")
+                    indexed_contents = {doc.get("content") for doc in self.documents}
+                    self.documents.extend(
+                        doc for doc in new_docs if doc.get("content") not in indexed_contents
+                    )
                     self.document_embeddings = []
+            else:
+                self._append_documents_with_embeddings(new_docs)
         else:
             logger.info("Toate documentele sunt deja în index")
         
@@ -1098,8 +1175,7 @@ class SimpleRetriever:
         new_docs = [doc for doc in documents if doc['content'] not in existing_contents]
         
         if new_docs:
-            self.documents.extend(new_docs)
-            logger.info(f"Adăugat {len(new_docs)} documente noi la indexul existent de {len(self.documents) - len(new_docs)} documente")
+            logger.info("Adaug %s documente noi la indexul existent de %s documente", len(new_docs), len(self.documents))
         else:
             logger.info("Toate documentele sunt deja în index")
         
@@ -1112,21 +1188,25 @@ class SimpleRetriever:
                     new_embeddings = self.embeddings_model.encode(new_contents)
                     
                     # Concatenează cu embeddings existente
-                    import numpy as np
-                    if NUMPY_AVAILABLE and len(self.document_embeddings) > 0:
-                        self.document_embeddings = np.vstack([self.document_embeddings, new_embeddings])
-                    else:
-                        self.document_embeddings = new_embeddings
+                    self._append_documents_with_embeddings(new_docs, new_embeddings)
                     
                     logger.info(f"Adăugat embeddings pentru {len(new_docs)} documente noi")
                 else:
                     # Generează embeddings pentru toate documentele (prima încărcare sau regenerare)
+                    if new_docs:
+                        self.documents.extend(new_docs)
                     contents = [doc['content'] for doc in self.documents]
                     self.document_embeddings = self.embeddings_model.encode(contents)
                     logger.info(f"Generat embeddings pentru toate {len(self.documents)} documentele")
             except Exception as e:
                 logger.error(f"Eroare la generarea embeddings: {e}")
+                indexed_contents = {doc.get("content") for doc in self.documents}
+                self.documents.extend(
+                    doc for doc in new_docs if doc.get("content") not in indexed_contents
+                )
                 self.document_embeddings = []
+        elif new_docs:
+            self._append_documents_with_embeddings(new_docs)
         
         self._rebuild_chunk_lookup()
         logger.info(f"Index actualizat cu {len(self.documents)} documente totale")
@@ -1827,7 +1907,8 @@ RĂSPUNS:"""
         question: str,
         scope_filter: Optional[Any],
         collection_filters: Optional[List[str]],
-        k: int
+        k: int,
+        base_embedding: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
         final_k = max(int(k), int(self.config.vector_top_k))
 
@@ -1839,8 +1920,9 @@ RĂSPUNS:"""
         )
         retrieval_k = max(final_k, int(self.config.reranker_input_k)) if rerank_active else final_k
 
-        # Optional HyDE: medie embeddings (query + pseudo-doc generat)
-        query_embedding = self._compute_query_embedding(question)
+        # Optional HyDE: medie embeddings (query + pseudo-doc generat).
+        # base_embedding e calculat o singura data per request si reutilizat.
+        query_embedding = self._compute_query_embedding(question, base_embedding=base_embedding)
 
         # Prefer Postgres vector retrieval if configured.
         if (
@@ -1884,14 +1966,25 @@ RĂSPUNS:"""
             return documents[: int(top_k)]
         return self.reranker.rerank(question, documents, top_k=top_k)
 
-    def _compute_query_embedding(self, question: str) -> Optional[List[float]]:
-        """Calculeaza embedding-ul query-ului. Daca HyDE e activ, mediaza cu pseudo-doc."""
+    def _compute_query_embedding(
+        self,
+        question: str,
+        base_embedding: Optional[List[float]] = None,
+    ) -> Optional[List[float]]:
+        """Calculeaza embedding-ul query-ului. Daca HyDE e activ, mediaza cu pseudo-doc.
+
+        base_embedding (optional) e embedding-ul plain al intrebarii, calculat o
+        singura data per request si reutilizat ca sa evitam re-encodarea.
+        """
         if self.retriever.embeddings_model is None:
             return None
         try:
-            base_emb = self.retriever.embeddings_model.encode([question])[0]
-            if hasattr(base_emb, "tolist"):
-                base_emb = base_emb.tolist()
+            if base_embedding is not None:
+                base_emb = base_embedding
+            else:
+                base_emb = self.retriever.embeddings_model.encode([question])[0]
+                if hasattr(base_emb, "tolist"):
+                    base_emb = base_emb.tolist()
 
             if self.config.enable_hyde:
                 pseudo_doc = self._generate_hyde_pseudo_doc(question)
@@ -3255,12 +3348,17 @@ INSTRUCȚIUNI:
                 general_collection,
             )
 
+            # Embedding plain al intrebarii, calculat o singura data si reutilizat
+            # pentru vector search, note si memory artifacts (evita 3x re-encode).
+            shared_query_embedding = self._embed_note_text("", question)
+
             # Regăsește context vectorial.
             vector_docs = self._run_vector_retrieval(
                 question,
                 scope_filter=scope_filter,
                 collection_filters=collection_filters,
                 k=self.config.max_context_docs,
+                base_embedding=shared_query_embedding,
             )
 
             # Router intent -> retrieval plan.
@@ -3309,6 +3407,7 @@ INSTRUCȚIUNI:
                 query=question,
                 topic_collection=notes_topic_scope,
                 top_k=3,
+                precomputed_embedding=shared_query_embedding,
             ) if include_memory else []
 
             memory_topic_scope = active_collection if scope_mode == "topic" else None
@@ -3316,6 +3415,7 @@ INSTRUCȚIUNI:
                 query=question,
                 topic_collection=memory_topic_scope,
                 top_k=6,
+                precomputed_embedding=shared_query_embedding,
             ) if include_memory else []
 
             if not vector_docs and not graph_paths and not note_hits and not memory_artifact_hits:
@@ -4287,11 +4387,16 @@ INSTRUCȚIUNI:
         query: str,
         topic_collection: Optional[str] = None,
         top_k: int = 6,
+        precomputed_embedding: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
-        """Vector search over canonical memory artifacts with typed citations."""
+        """Vector search over canonical memory artifacts with typed citations.
+
+        precomputed_embedding (optional) reuses an already-computed query
+        embedding to avoid re-encoding the same text within a request.
+        """
         if not self.repository or not self.repository.enabled:
             return []
-        embedding = self._embed_note_text("", query)
+        embedding = precomputed_embedding if precomputed_embedding is not None else self._embed_note_text("", query)
         if embedding is None:
             return []
         artifacts = self.repository.vector_search_memory(
@@ -4521,11 +4626,16 @@ INSTRUCȚIUNI:
         query: str,
         topic_collection: Optional[str] = None,
         top_k: int = 5,
+        precomputed_embedding: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
-        """Vector search over notes for retrieval / surfacing."""
+        """Vector search over notes for retrieval / surfacing.
+
+        precomputed_embedding (optional) reuses an already-computed query
+        embedding to avoid re-encoding the same text within a request.
+        """
         if not self.repository or not self.repository.enabled:
             return []
-        embedding = self._embed_note_text("", query)
+        embedding = precomputed_embedding if precomputed_embedding is not None else self._embed_note_text("", query)
         if embedding is None:
             return []
         return self.repository.vector_search_notes(

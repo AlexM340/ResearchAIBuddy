@@ -10,6 +10,8 @@ from typing import Any, Dict, List
 
 import streamlit as st
 
+from views import _cache
+from views._cache import invalidate_reads
 from views._documents import save_text_as_document
 from views._shared import (
     DEFAULT_CHAT_TITLE,
@@ -33,12 +35,19 @@ from views._suggestions import render_source_suggestions
 GLOBAL_QUERY_MODE = "all"
 SCOPE_TOPIC: str = ""  # global = fara topic_collection
 
+_EXAMPLE_PROMPTS = [
+    "Rezuma tot ce am salvat recent",
+    "Care sunt deciziile mele recente?",
+    "Ce am de facut saptamana asta?",
+]
 
 def render_second_brain() -> None:
-    """Randeaza pagina Second Brain (chat global) cu layout in 2 tab-uri.
+    """Pagina Second Brain: chat-first.
 
-    - Conversatie: chat controls + sugestii (collapsed) + istoric chat + chat input
-    - Insights & Tools: stats + panel-uri memorie/digest/contradictii
+    Zona principala e doar conversatia. Managementul chat-ului (selector, chat
+    nou, optiuni) si uneltele traiesc in bara laterala nativa din stanga
+    (pliabila). Fiecare unealta se deschide intr-un dialog modal, la cerere.
+    Utilizator nou fara surse: ghidaj in 3 pasi in loc de un ecran gol.
     """
     _render_header()
 
@@ -48,44 +57,263 @@ def render_second_brain() -> None:
 
     _render_pinned_reminders()
 
+    # Utilizator nou, fara surse indexate: ghideaza-l pas cu pas.
     if not has_indexed_documents():
-        _render_empty_state()
+        _render_guided_start()
         return
 
     apci_system = st.session_state.get("apci_system")
     web_available = bool(getattr(apci_system, "web_search_available", False)) if apci_system else False
 
-    chat_tab, tools_tab = st.tabs(["💬 Conversație", "🛠️ Insights & Tools"])
+    # Chat management + unelte -> bara laterala nativa (stanga). Main = doar chat.
+    _render_sidebar_panel(apci_system)
 
-    with chat_tab:
-        _render_chat_controls()
-        render_source_suggestions(topic_collection=None)
-        st.divider()
-        render_chat_history(
-            empty_message="Intreaba orice. Caut peste tot ce am invatat impreuna.",
-            target_collection=None,
+    pending_question: Optional[str] = None
+    if not st.session_state.get("chat_history"):
+        pending_question = _render_welcome_examples()
+    render_chat_history(
+        empty_message="Intreaba orice. Caut peste tot ce am invatat impreuna.",
+        target_collection=None,
+    )
+
+    if web_available:
+        st.checkbox(
+            "Cauta pe web pentru urmatoarea intrebare (Tavily)",
+            value=False,
+            key="sb_force_web_next",
+            help="Daca e bifat, urmatoarea intrebare este trimisa direct catre Tavily, ignorand sursele interne.",
         )
-        if web_available:
-            st.checkbox(
-                "Cauta pe web pentru urmatoarea intrebare (Tavily)",
-                value=False,
-                key="sb_force_web_next",
-                help="Daca e bifat, urmatoarea intrebare este trimisa direct catre Tavily, ignorand sursele interne.",
-            )
-
-    with tools_tab:
-        with st.expander("📊 Statistici sistem", expanded=False):
-            _render_quick_stats()
-        _render_second_brain_panels()
-
-    user_question = st.chat_input("Intreaba Second Brain...")
-    if user_question and user_question.strip():
+    typed_question = st.chat_input("Intreaba Second Brain...")
+    question = (typed_question or "").strip() or (pending_question or "")
+    if question:
         process_question(
-            user_question.strip(),
+            question,
             retrieval_mode=GLOBAL_QUERY_MODE,
             active_collection=None,
             force_web=bool(st.session_state.get("sb_force_web_next", False)) if web_available else False,
         )
+
+
+# ---------------------------------------------------------------------------
+# Onboarding + zona principala (chat-first)
+# ---------------------------------------------------------------------------
+
+
+def _render_guided_start() -> None:
+    """Ghidaj in 3 pasi pentru utilizatorii fara surse indexate."""
+    st.markdown("### Hai sa incepem 🚀")
+    st.caption("In 3 pasi simpli, Second Brain devine asistentul tau personal cu memorie.")
+
+    step1, step2, step3 = st.columns(3)
+    with step1:
+        with st.container(border=True):
+            st.markdown("#### 1 · 📚 Adauga o sursa")
+            st.write("Incarca un PDF/TXT/MD sau adauga un link intr-un notebook.")
+            if st.button(
+                "Deschide Notebooks",
+                use_container_width=True,
+                type="primary",
+                key="guided_goto_notebooks",
+            ):
+                navigate_to("notebooks")
+    with step2:
+        with st.container(border=True):
+            st.markdown("#### 2 · 💬 Pune o intrebare")
+            st.write("Dupa indexare, intreaba orice in caseta de chat. Iti raspund cu surse.")
+            st.caption("Caseta de chat apare dupa ce ai cel putin o sursa.")
+    with step3:
+        with st.container(border=True):
+            st.markdown("#### 3 · 🧠 Vezi ce am invatat")
+            st.write("Decizii, preferinte si task-uri apar in panoul **Unelte** din bara laterala.")
+
+    st.divider()
+    st.info("Inca nu ai surse indexate. Incepe cu pasul 1.")
+
+
+def _render_welcome_examples() -> Optional[str]:
+    """Mesaj de bun venit + intrebari-exemplu. Returneaza intrebarea aleasa."""
+    st.markdown("#### Bine ai venit la Second Brain 👋")
+    st.caption(
+        "Iti raspund pe baza a tot ce ai salvat. Incearca una din intrebarile de mai jos "
+        "sau scrie a ta in casuta de jos."
+    )
+
+    chosen: Optional[str] = None
+    cols = st.columns(len(_EXAMPLE_PROMPTS))
+    for idx, (col, prompt) in enumerate(zip(cols, _EXAMPLE_PROMPTS)):
+        with col:
+            if st.button(prompt, key=f"sb_example_{idx}", use_container_width=True):
+                chosen = prompt
+    st.divider()
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Bara laterala: chat management + unelte (dialoguri la cerere)
+# ---------------------------------------------------------------------------
+
+
+def _render_sidebar_panel(apci_system) -> None:
+    """Randeaza chat management + meniul de unelte in bara laterala nativa."""
+    requested_tool: Optional[str] = None
+    with st.sidebar:
+        st.divider()
+        st.markdown("### 💬 Chat")
+        _render_sidebar_chat_controls()
+        st.divider()
+        st.markdown("### 🛠️ Unelte")
+        requested_tool = _render_sidebar_tools(apci_system)
+
+    # Modalul e la nivel de pagina: il deschidem in afara contextului sidebar.
+    _open_tool_dialog(requested_tool, apci_system)
+
+
+def _render_sidebar_chat_controls() -> None:
+    """Selector chat global + chat nou + optiuni (redenumire/curata/sterge)."""
+    manager = get_chat_manager()
+    if not manager:
+        st.warning("Persistenta chat-urilor nu este disponibila.")
+        return
+
+    # Dupa o actiune programatica (Nou/Sterge) aplicam selectia in asteptare INAINTE
+    # de a instantia selectbox-ul; altfel valoarea veche ramasa in widget ar suprascrie
+    # chat-ul activ la rerun (si "Nou" nu te-ar duce pe chat-ul nou).
+    if "_sb_pending_chat" in st.session_state:
+        pending_chat = st.session_state.pop("_sb_pending_chat")
+        if pending_chat:
+            st.session_state["sb_chat_selector"] = pending_chat
+        else:
+            st.session_state.pop("sb_chat_selector", None)
+
+    ensure_active_chat_for_scope(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
+
+    sessions = [
+        s for s in _cache.chat_sessions(manager, type(manager).__name__)
+        if not (s.get("topic_collection") or "").strip()
+    ]
+    session_map = {s["id"]: s for s in sessions}
+    session_ids = list(session_map.keys())
+    active_chat_id = st.session_state.get("active_chat_id", "")
+
+    if session_ids:
+        default_index = session_ids.index(active_chat_id) if active_chat_id in session_ids else 0
+        selected_id = st.selectbox(
+            "Chat global activ",
+            options=session_ids,
+            index=default_index,
+            format_func=lambda chat_id: format_chat_label(session_map[chat_id]),
+            key="sb_chat_selector",
+            label_visibility="collapsed",
+        )
+        if selected_id != active_chat_id:
+            switch_active_chat(selected_id)
+            st.rerun()
+    else:
+        st.caption("Nu exista chat-uri globale inca.")
+
+    col_new, col_opts = st.columns(2)
+    with col_new:
+        if st.button("➕ Nou", use_container_width=True, key="sb_chat_new"):
+            new_id = create_chat_in_scope(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
+            if new_id:
+                st.session_state["_sb_pending_chat"] = new_id
+            st.rerun()
+    with col_opts:
+        with st.popover("⚙️ Optiuni", use_container_width=True):
+            new_title = st.text_input(
+                "Titlu chat",
+                value=st.session_state.get("chat_title_draft", DEFAULT_CHAT_TITLE),
+                key="sb_chat_title_input",
+            )
+            if st.button("Salveaza titlu", use_container_width=True, key="sb_chat_rename"):
+                if rename_active_chat(new_title):
+                    st.success("Titlu actualizat.")
+                    st.rerun()
+            if st.button("🧹 Curata mesaje", use_container_width=True, key="sb_chat_clear"):
+                clear_active_chat()
+                st.rerun()
+            st.divider()
+            if st.button("🗑️ Sterge chat", use_container_width=True, key="sb_chat_delete"):
+                delete_active_chat(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
+                # Sincronizeaza selectbox-ul cu noul chat activ ales de ensure_*.
+                st.session_state["_sb_pending_chat"] = st.session_state.get("active_chat_id") or None
+                st.rerun()
+
+
+def _render_sidebar_tools(apci_system) -> Optional[str]:
+    """Meniu de unelte. Returneaza cheia uneltei cerute (dialogul se deschide dupa)."""
+    try:
+        proposals = _cache.memory_proposals(apci_system, "pending", 30) or []
+    except Exception:
+        proposals = []
+    inbox_label = f"📥 Inbox ({len(proposals)})" if proposals else "📥 Inbox"
+
+    requested: Optional[str] = None
+    if st.button(inbox_label, use_container_width=True, key="sb_tool_inbox"):
+        requested = "inbox"
+    if st.button("📊 Insights", use_container_width=True, key="sb_tool_insights"):
+        requested = "insights"
+    if st.button("✏️ Editor memorie", use_container_width=True, key="sb_tool_editor"):
+        requested = "editor"
+    if st.button("⚠️ Contradictii", use_container_width=True, key="sb_tool_contradictions"):
+        requested = "contradictions"
+    if st.button("🔭 Analize globale", use_container_width=True, key="sb_tool_analysis"):
+        requested = "analysis"
+    if st.button("🔎 Sugestii surse", use_container_width=True, key="sb_tool_suggestions"):
+        requested = "suggestions"
+    return requested
+
+
+def _open_tool_dialog(tool: Optional[str], apci_system) -> None:
+    if tool == "inbox":
+        _dialog_inbox(apci_system)
+    elif tool == "insights":
+        _dialog_insights(apci_system)
+    elif tool == "editor":
+        _dialog_editor(apci_system)
+    elif tool == "contradictions":
+        _dialog_contradictions(apci_system)
+    elif tool == "analysis":
+        _dialog_analysis(apci_system)
+    elif tool == "suggestions":
+        _dialog_suggestions()
+
+
+@st.dialog("📥 Inbox memorie", width="large")
+def _dialog_inbox(apci_system) -> None:
+    _render_memory_inbox(apci_system)
+
+
+@st.dialog("📊 Insights", width="large")
+def _dialog_insights(apci_system) -> None:
+    _render_quick_stats()
+    st.divider()
+    st.markdown("#### 📅 Digest")
+    _render_weekly_digest(apci_system)
+    st.markdown("#### 🧠 Memorie recenta")
+    _render_memory_surfacing(apci_system)
+    st.markdown("#### 🌫️ Decizii de revizuit")
+    _render_decision_drift(apci_system)
+
+
+@st.dialog("✏️ Editor memorie", width="large")
+def _dialog_editor(apci_system) -> None:
+    _render_memory_editor(apci_system)
+
+
+@st.dialog("⚠️ Contradictii in cunostinte", width="large")
+def _dialog_contradictions(apci_system) -> None:
+    _render_contradictions(apci_system)
+
+
+@st.dialog("🔭 Analize globale", width="large")
+def _dialog_analysis(apci_system) -> None:
+    _render_global_analysis(apci_system)
+
+
+@st.dialog("🔎 Sugestii surse", width="large")
+def _dialog_suggestions() -> None:
+    render_source_suggestions(topic_collection=None)
 
 
 # ---------------------------------------------------------------------------
@@ -98,14 +326,6 @@ def _render_header() -> None:
     st.caption(
         "Asistentul tau personal cu memorie peste **toate** sursele si conversatiile tale. "
         "Intreaba orice, indiferent de notebook."
-    )
-
-
-def _render_empty_state() -> None:
-    st.warning("Inca nu ai surse indexate.")
-    st.markdown(
-        "Mergi la tab-ul **Notebooks** pentru a-ti crea primul notebook si a incarca documente. "
-        "Pe masura ce adaugi surse, Second Brain le va invata pe toate."
     )
 
 
@@ -128,7 +348,7 @@ def _render_quick_stats() -> None:
     sb_status = {}
     if hasattr(apci_system, "get_second_brain_status"):
         try:
-            sb_status = apci_system.get_second_brain_status() or {}
+            sb_status = _cache.second_brain_status(apci_system) or {}
         except Exception:
             sb_status = {}
 
@@ -137,74 +357,6 @@ def _render_quick_stats() -> None:
     open_tasks = int(db_stats.get("tasks_open_count", 0) or 0)
     cols[2].metric("Decizii memorate", decisions)
     cols[3].metric("Task-uri active", open_tasks)
-
-
-def _render_chat_controls() -> None:
-    """Selector chat global + actiuni (nou/sterge/redenumire/curata)."""
-    manager = get_chat_manager()
-    if not manager:
-        st.warning("Persistenta chat-urilor nu este disponibila.")
-        return
-
-    ensure_active_chat_for_scope(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
-
-    sessions = [
-        s for s in manager.list_sessions()
-        if not (s.get("topic_collection") or "").strip()
-    ]
-    session_map = {s["id"]: s for s in sessions}
-    session_ids = list(session_map.keys())
-    active_chat_id = st.session_state.get("active_chat_id", "")
-
-    if not session_ids:
-        st.caption("Nu exista chat-uri globale inca.")
-        return
-
-    default_index = session_ids.index(active_chat_id) if active_chat_id in session_ids else 0
-
-    col_select, col_new, col_del = st.columns([4, 1, 1])
-
-    with col_select:
-        selected_id = st.selectbox(
-            "Chat global activ",
-            options=session_ids,
-            index=default_index,
-            format_func=lambda chat_id: format_chat_label(session_map[chat_id]),
-            key="sb_chat_selector",
-            label_visibility="collapsed",
-        )
-        if selected_id != active_chat_id:
-            switch_active_chat(selected_id)
-            st.rerun()
-
-    with col_new:
-        if st.button("Chat nou", use_container_width=True, key="sb_chat_new"):
-            create_chat_in_scope(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
-            st.rerun()
-
-    with col_del:
-        if st.button("Sterge", use_container_width=True, key="sb_chat_delete"):
-            delete_active_chat(SCOPE_TOPIC, GLOBAL_QUERY_MODE)
-            st.rerun()
-
-    with st.expander("Optiuni chat", expanded=False):
-        col_title, col_save, col_clear = st.columns([3, 1, 1])
-        with col_title:
-            new_title = st.text_input(
-                "Titlu chat",
-                value=st.session_state.get("chat_title_draft", DEFAULT_CHAT_TITLE),
-                key="sb_chat_title_input",
-                label_visibility="collapsed",
-            )
-        with col_save:
-            if st.button("Salveaza titlu", use_container_width=True, key="sb_chat_rename"):
-                if rename_active_chat(new_title):
-                    st.success("Titlu actualizat.")
-                    st.rerun()
-        with col_clear:
-            if st.button("Curata mesaje", use_container_width=True, key="sb_chat_clear"):
-                clear_active_chat()
-                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +371,7 @@ def _render_pinned_reminders() -> None:
         return
 
     try:
-        due_soon = apci_system.list_due_soon_tasks(within_days=1, limit=5) or []
+        due_soon = _cache.due_soon_tasks(apci_system, 1, 5) or []
     except Exception:
         return
 
@@ -253,39 +405,17 @@ def _render_pinned_reminders() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_second_brain_panels() -> None:
-    """Randeaza panel-urile E4 + P2 (weekly digest + memory editor)."""
-    apci_system = st.session_state.get("apci_system")
-    if not apci_system:
-        return
-
-    _render_weekly_digest(apci_system)
-    _render_memory_inbox(apci_system)
-    _render_global_analysis(apci_system)
-
-    panel_left, panel_right = st.columns(2)
-
-    with panel_left:
-        _render_memory_surfacing(apci_system)
-
-    with panel_right:
-        _render_decision_drift(apci_system)
-
-    _render_memory_editor(apci_system)
-    _render_contradictions(apci_system)
-
-
 def _render_memory_inbox(apci_system) -> None:
     """Persistent inbox for medium-confidence memory proposals."""
     if not hasattr(apci_system, "list_memory_proposals"):
         return
 
     try:
-        proposals = apci_system.list_memory_proposals(status="pending", limit=30) or []
+        proposals = _cache.memory_proposals(apci_system, "pending", 30) or []
     except Exception:
         proposals = []
 
-    with st.expander(f"Inbox memorie ({len(proposals)})", expanded=bool(proposals)):
+    with st.container():
         st.caption("Propuneri detectate din conversatii. Accepta doar elementele corecte.")
         if not proposals:
             st.info("Nu exista propuneri pending.")
@@ -389,12 +519,14 @@ def _render_memory_proposal_card(apci_system, proposal: Dict[str, Any]) -> None:
 
         if accept:
             if apci_system.accept_memory_proposal(proposal_id, edited_payload):
+                invalidate_reads()
                 st.success("Propunere salvata.")
                 st.rerun()
             else:
                 st.error("Nu am putut salva propunerea.")
         if dismiss:
             if apci_system.dismiss_memory_proposal(proposal_id):
+                invalidate_reads()
                 st.rerun()
             else:
                 st.error("Nu am putut marca propunerea ca dismissed.")
@@ -412,7 +544,7 @@ def _render_global_analysis(apci_system) -> None:
     taxonomy_key = "sb_global_taxonomy"
     gaps_key = "sb_global_gaps"
 
-    with st.expander("Analize globale", expanded=False):
+    with st.container():
         col_synth, col_tax, col_gap, col_clear = st.columns([1, 1, 1, 1])
         with col_synth:
             if st.button("Sinteza globala", key="sb_global_synth_btn", use_container_width=True):
@@ -490,22 +622,22 @@ def _render_analysis_result(label: str, data: Dict[str, Any] | None, filename_pr
 
 def _render_memory_surfacing(apci_system) -> None:
     """Carduri proactive: decizii recente, task-uri active, preferinte de top."""
-    with st.expander("Memorie surfaced", expanded=False):
+    with st.container():
         st.caption("Ce am invatat recent despre tine si ce ai de facut.")
 
         recent_decisions: list = []
         open_tasks: list = []
         top_prefs: list = []
         try:
-            recent_decisions = apci_system.list_recent_decisions(limit=5) or []
+            recent_decisions = _cache.recent_decisions(apci_system, 5) or []
         except Exception:
             pass
         try:
-            open_tasks = apci_system.list_open_tasks(limit=5) or []
+            open_tasks = _cache.open_tasks(apci_system, 5) or []
         except Exception:
             pass
         try:
-            top_prefs = apci_system.list_top_preferences(limit=5) or []
+            top_prefs = _cache.top_preferences(apci_system, 5) or []
         except Exception:
             pass
 
@@ -547,7 +679,7 @@ def _render_memory_surfacing(apci_system) -> None:
 
 def _render_decision_drift(apci_system) -> None:
     """Decizii vechi, candidat pentru review."""
-    with st.expander("Decision drift", expanded=False):
+    with st.container():
         st.caption("Decizii mai vechi care ar putea fi depasite — verifica daca mai sunt valide.")
 
         threshold_days = st.slider(
@@ -560,7 +692,7 @@ def _render_decision_drift(apci_system) -> None:
         )
 
         try:
-            aged = apci_system.list_aged_decisions(min_age_days=threshold_days, limit=10) or []
+            aged = _cache.aged_decisions(apci_system, threshold_days, 10) or []
         except Exception:
             aged = []
 
@@ -583,7 +715,7 @@ def _render_decision_drift(apci_system) -> None:
 
 def _render_contradictions(apci_system) -> None:
     """Tensiuni detectate in graful de cunostinte (relatii CONTRADICTS)."""
-    with st.expander("Contradictii in cunostinte", expanded=False):
+    with st.container():
         neo4j_client = getattr(apci_system, "neo4j_client", None)
         if not neo4j_client or not getattr(neo4j_client, "enabled", False):
             st.caption("Neo4j nu este disponibil — contradictii nu pot fi detectate.")
@@ -600,16 +732,7 @@ def _render_contradictions(apci_system) -> None:
             )
 
         try:
-            contradictions = apci_system.get_contradictions(
-                limit=20,
-                include_dismissed=include_dismissed,
-            ) or []
-        except TypeError:
-            # Backward-compat daca system wrapper nu accepta include_dismissed.
-            try:
-                contradictions = apci_system.get_contradictions(limit=20) or []
-            except Exception:
-                contradictions = []
+            contradictions = _cache.contradictions(apci_system, 20, include_dismissed) or []
         except Exception:
             contradictions = []
 
@@ -655,6 +778,7 @@ def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: boo
                 use_container_width=True,
             ):
                 if apci_system.restore_contradiction(source=source, target=target):
+                    invalidate_reads()
                     st.rerun()
                 else:
                     st.error("Restore esuat.")
@@ -665,6 +789,7 @@ def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: boo
                 use_container_width=True,
             ):
                 if apci_system.dismiss_contradiction(source=source, target=target):
+                    invalidate_reads()
                     st.rerun()
                 else:
                     st.error("Dismiss esuat.")
@@ -677,7 +802,7 @@ def _render_contradiction_card(apci_system, item: Dict[str, Any], dismissed: boo
 
 def _render_weekly_digest(apci_system) -> None:
     """Sumar al activitatii din ultima fereastra de N zile."""
-    with st.expander("Digest", expanded=False):
+    with st.container():
         col_label, col_window = st.columns([3, 1])
         with col_label:
             st.caption("Ce am invatat si ce ai facut in ultima perioada.")
@@ -691,7 +816,7 @@ def _render_weekly_digest(apci_system) -> None:
             )
 
         try:
-            summary = apci_system.get_weekly_summary(days=int(window)) or {}
+            summary = _cache.weekly_summary(apci_system, int(window)) or {}
         except Exception:
             summary = {}
 
@@ -738,7 +863,7 @@ def _render_weekly_digest(apci_system) -> None:
 
 def _render_memory_editor(apci_system) -> None:
     """Editor cu CRUD pentru decizii si preferinte memorate."""
-    with st.expander("Editor memorie", expanded=False):
+    with st.container():
         st.caption("Editeaza ce am invatat despre tine. Corecteaza, sterge sau ajusteaza incrementul de incredere.")
 
         tab_decisions, tab_preferences = st.tabs(["Decizii", "Preferinte"])
@@ -752,7 +877,7 @@ def _render_memory_editor(apci_system) -> None:
 
 def _render_decisions_editor(apci_system) -> None:
     try:
-        decisions = apci_system.list_all_decisions(limit=200) or []
+        decisions = _cache.all_decisions(apci_system, 200) or []
     except Exception:
         decisions = []
 
@@ -795,6 +920,7 @@ def _render_decisions_editor(apci_system) -> None:
                         use_container_width=True,
                     ):
                         apci_system.delete_decision(decision_id)
+                        invalidate_reads()
                         st.session_state.pop(confirm_key, None)
                         st.rerun()
                 else:
@@ -859,6 +985,7 @@ def _render_decision_edit_form(apci_system, decision: Dict[str, Any], edit_key: 
                 confidence=new_conf,
             )
             if ok:
+                invalidate_reads()
                 st.session_state.pop(edit_key, None)
                 st.rerun()
             else:
@@ -870,7 +997,7 @@ def _render_decision_edit_form(apci_system, decision: Dict[str, Any], edit_key: 
 
 def _render_preferences_editor(apci_system) -> None:
     try:
-        preferences = apci_system.list_all_preferences(limit=200) or []
+        preferences = _cache.all_preferences(apci_system, 200) or []
     except Exception:
         preferences = []
 
@@ -910,6 +1037,7 @@ def _render_preferences_editor(apci_system) -> None:
                         use_container_width=True,
                     ):
                         apci_system.delete_preference(pref_id)
+                        invalidate_reads()
                         st.session_state.pop(confirm_key, None)
                         st.rerun()
                 else:
@@ -973,6 +1101,7 @@ def _render_preference_edit_form(apci_system, pref: Dict[str, Any], edit_key: st
                 topic_collection=topic_value,
             )
             if ok:
+                invalidate_reads()
                 st.session_state.pop(edit_key, None)
                 st.rerun()
             else:

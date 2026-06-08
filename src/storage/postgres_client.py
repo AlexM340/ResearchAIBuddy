@@ -5,6 +5,7 @@ Postgres client wrapper used by the Second Brain storage layer.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
@@ -19,6 +20,14 @@ except Exception:
     psycopg = None
     PSYCOPG_AVAILABLE = False
 
+try:
+    from psycopg_pool import ConnectionPool
+
+    PSYCOPG_POOL_AVAILABLE = True
+except Exception:
+    ConnectionPool = None
+    PSYCOPG_POOL_AVAILABLE = False
+
 
 class PostgresClient:
     """Thin wrapper over psycopg with optional runtime enablement."""
@@ -28,23 +37,70 @@ class PostgresClient:
         dsn: str = "",
         embedding_dim: int = 384,
         enabled: bool = True,
+        pool_min_size: int = 1,
+        pool_max_size: int = 10,
     ):
         self.dsn = (dsn or "").strip()
         self.embedding_dim = int(embedding_dim or 384)
         self.enabled = bool(enabled and self.dsn and PSYCOPG_AVAILABLE)
+        self.pool_min_size = int(pool_min_size)
+        self.pool_max_size = int(pool_max_size)
+
+        # Lazily-created connection pool, guarded for thread-safe init.
+        self._pool: Optional["ConnectionPool"] = None
+        self._pool_lock = threading.Lock()
 
         if enabled and not PSYCOPG_AVAILABLE:
             logger.warning("psycopg nu este disponibil; storage Postgres dezactivat.")
         if enabled and not self.dsn:
             logger.info("storage.postgres_dsn nu este configurat; storage Postgres dezactivat.")
 
+    def _get_pool(self) -> Optional["ConnectionPool"]:
+        """Return a lazily-initialized connection pool, or None if unavailable.
+
+        Pooling avoids a fresh TCP+TLS handshake on every repository call.
+        Falls back transparently to one-shot connections when psycopg_pool
+        is not installed, so behaviour is unchanged in that case.
+        """
+        if not self.enabled or not PSYCOPG_POOL_AVAILABLE:
+            return None
+        if self._pool is not None:
+            return self._pool
+        with self._pool_lock:
+            if self._pool is None:
+                try:
+                    self._pool = ConnectionPool(
+                        conninfo=self.dsn,
+                        min_size=self.pool_min_size,
+                        max_size=self.pool_max_size,
+                        kwargs={"autocommit": False},
+                        open=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Connection pool init failed, using one-shot connections: %s", exc)
+                    self._pool = None
+        return self._pool
+
     @contextmanager
     def connection(self) -> Generator[Optional["psycopg.Connection"], None, None]:
-        """Open a connection if Postgres is enabled."""
+        """Yield a pooled connection if Postgres is enabled.
+
+        The connection is borrowed from the pool for the duration of the
+        ``with`` block and returned afterwards (not physically closed). When
+        no pool is available it degrades to a single-use connection, matching
+        the previous behaviour exactly.
+        """
         if not self.enabled:
             yield None
             return
 
+        pool = self._get_pool()
+        if pool is not None:
+            with pool.connection() as conn:
+                yield conn
+            return
+
+        # Fallback: one-shot connection (no pooling available).
         conn = None
         try:
             conn = psycopg.connect(self.dsn, autocommit=False)
@@ -52,6 +108,17 @@ class PostgresClient:
         finally:
             if conn is not None:
                 conn.close()
+
+    def close(self) -> None:
+        """Dispose the connection pool, if any. Safe to call multiple times."""
+        with self._pool_lock:
+            if self._pool is not None:
+                try:
+                    self._pool.close()
+                except Exception as exc:
+                    logger.warning("Connection pool close failed: %s", exc)
+                finally:
+                    self._pool = None
 
     def test_connection(self) -> bool:
         """Validate DB connection and pgvector availability."""
