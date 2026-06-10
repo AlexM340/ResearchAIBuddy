@@ -22,12 +22,20 @@ RELATION_COLORS = {
     "DEPENDS_ON": "#82b366",
     "CONTRADICTS": "#e06c75",
     "DERIVED_FROM": "#d79b00",
+    "USES": "#56b6c2",
+    "PART_OF": "#b07cc6",
+    "IMPROVES": "#98c379",
+    "PROPOSED_BY": "#c0986a",
 }
 RELATION_LABELS = {
     "RELATED_TO": "Legat de",
     "DEPENDS_ON": "Depinde de",
     "CONTRADICTS": "Contrazice",
     "DERIVED_FROM": "Derivat din",
+    "USES": "Foloseste",
+    "PART_OF": "Parte din",
+    "IMPROVES": "Imbunatateste",
+    "PROPOSED_BY": "Propus de",
 }
 ALL_RELATION_TYPES = list(RELATION_COLORS.keys())
 

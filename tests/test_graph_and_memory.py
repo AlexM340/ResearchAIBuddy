@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import MethodType, SimpleNamespace
 
-from src.graph.graph_ingestion import GraphIngestionService
+from src.graph.graph_ingestion import ConceptResolver, GraphIngestionService
 from src.rag_module_flash import APCISystem
 
 
@@ -73,6 +73,176 @@ def test_graph_ingestion_structured_mode_applies_confidence_gating():
     assert result["concepts"] == 1
     assert result["relations"] == 1
     assert any("DEPENDS_ON" in cypher for cypher, _ in client.writes)
+
+
+def test_graph_ingestion_writes_entity_types_and_relation_evidence():
+    client = DummyNeo4jClient()
+
+    def structured_extractor(_text: str):
+        return {
+            "concepts": [
+                {
+                    "name": "HNSW",
+                    "type": "Technology",
+                    "aliases": ["hnsw index"],
+                    "description": "graph-based ANN index",
+                    "confidence": 0.9,
+                },
+            ],
+            "relations": [
+                {
+                    "source": "pgvector",
+                    "target": "HNSW",
+                    "type": "USES",
+                    "evidence": "pgvector builds an HNSW index",
+                    "confidence": 0.88,
+                },
+            ],
+        }
+
+    service = GraphIngestionService(
+        neo4j_client=client,
+        min_confidence=0.70,
+        extraction_mode="llm_structured",
+        structured_extractor=structured_extractor,
+    )
+    service.ingest_chunks(
+        [
+            {
+                "content": "pgvector builds an HNSW index.",
+                "metadata": {
+                    "source_path": "d:/tmp/doc.txt",
+                    "doc_id": "doc_1",
+                    "filename": "doc.txt",
+                    "collection": "general",
+                    "chunk_id": 0,
+                },
+            }
+        ]
+    )
+
+    # Concept node carries entity type + description.
+    concept_writes = [(c, p) for c, p in client.writes if "MENTIONS" in c]
+    assert concept_writes
+    assert any("k.type" in c and "k.description" in c for c, _ in concept_writes)
+    assert any(p.get("type") == "Technology" for _, p in concept_writes)
+
+    # Relation carries evidence + corroboration counter + typed edge.
+    rel_writes = [(c, p) for c, p in client.writes if "MERGE (a:Concept" in c and "USES" in c]
+    assert rel_writes
+    assert any("r.evidence" in c and "r.observations" in c for c, _ in rel_writes)
+    assert any(p.get("evidence") == "pgvector builds an HNSW index" for _, p in rel_writes)
+
+
+def test_graph_ingestion_batches_extraction_into_single_call():
+    client = DummyNeo4jClient()
+    calls = {"n": 0, "sizes": []}
+
+    def batch_extractor(texts):
+        calls["n"] += 1
+        calls["sizes"].append(len(texts))
+        payloads = []
+        for text in texts:
+            if "graphrag" in text.lower():
+                payloads.append(
+                    {"concepts": [{"name": "GraphRAG", "type": "Method", "confidence": 0.9}], "relations": []}
+                )
+            else:
+                payloads.append(
+                    {"concepts": [{"name": "Vector", "type": "Technology", "confidence": 0.9}], "relations": []}
+                )
+        return payloads
+
+    service = GraphIngestionService(
+        neo4j_client=client,
+        min_confidence=0.70,
+        extraction_mode="llm_structured",
+        structured_extractor=lambda _t: {},
+        batch_extractor=batch_extractor,
+        extraction_batch_size=5,
+    )
+    chunks = [
+        {
+            "content": "graphrag content",
+            "metadata": {"source_path": "d:/a.txt", "doc_id": "d1", "filename": "a", "collection": "general", "chunk_id": 0},
+        },
+        {
+            "content": "vector content",
+            "metadata": {"source_path": "d:/a.txt", "doc_id": "d1", "filename": "a", "collection": "general", "chunk_id": 1},
+        },
+    ]
+    result = service.ingest_chunks(chunks)
+
+    assert result["chunks"] == 2
+    assert result["concepts"] == 2
+    assert calls["n"] == 1          # ambele chunk-uri intr-un SINGUR apel LLM
+    assert calls["sizes"] == [2]
+
+
+def test_concept_resolver_normalize_singularizes_safely():
+    assert ConceptResolver.normalize("Models") == "model"
+    assert ConceptResolver.normalize("vector embeddings") == "vector embedding"
+    # nu scurta sufixe inselatoare
+    assert ConceptResolver.normalize("analysis") == "analysis"
+    assert ConceptResolver.normalize("process") == "process"
+
+
+def test_concept_resolver_dedups_via_embeddings():
+    def embedder(text: str):
+        t = (text or "").lower()
+        if "machine learning" in t or t.strip().startswith("ml"):
+            return [1.0, 0.0, 0.0]
+        if "vector" in t:
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
+
+    resolver = ConceptResolver(DummyNeo4jClient(), embedder=embedder, threshold=0.9)
+    canonical = resolver.resolve("machine learning", node_type="Concept")
+    deduped = resolver.resolve("ML", node_type="Concept")  # acronim non-lexical
+    assert deduped == canonical  # rezolvat la acelasi concept canonic
+    other = resolver.resolve("vector search")
+    assert other != canonical
+
+
+def test_rebuild_communities_groups_connected_concepts():
+    class CommunityClient:
+        enabled = True
+
+        def __init__(self) -> None:
+            self.writes = []
+
+        def run_write(self, cypher, parameters=None):
+            self.writes.append((cypher, parameters or {}))
+            return True
+
+        def run_read(self, cypher, parameters=None):
+            if "a.name AS source" in cypher:
+                # Doua componente conexe: {a,b,c} si {x,y}.
+                return [
+                    {"source": "a", "target": "b"},
+                    {"source": "b", "target": "c"},
+                    {"source": "x", "target": "y"},
+                ]
+            if "coalesce(k.description" in cypher:
+                return [{"d": ""} for _ in (parameters or {}).get("members", [])]
+            return []
+
+    client = CommunityClient()
+    service = GraphIngestionService(
+        neo4j_client=client,
+        min_confidence=0.70,
+        extraction_mode="heuristic_fallback",
+    )
+    result = service.rebuild_communities(
+        summarizer=lambda members, descriptions: "tema comuna",
+        max_communities=10,
+        min_size=2,
+    )
+
+    assert result["communities"] == 2
+    assert result["summarized"] == 2
+    assert any("IN_COMMUNITY" in cypher for cypher, _ in client.writes)
+    assert any(p.get("summary") == "tema comuna" for _, p in client.writes)
 
 
 def _build_test_apci() -> APCISystem:

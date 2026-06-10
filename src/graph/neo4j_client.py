@@ -53,6 +53,7 @@ class Neo4jClient:
                 "CREATE CONSTRAINT artifact_id_unique IF NOT EXISTS FOR (a:Artifact) REQUIRE a.id IS UNIQUE",
                 "CREATE CONSTRAINT topic_id_unique IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
                 "CREATE CONSTRAINT concept_name_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.name IS UNIQUE",
+                "CREATE CONSTRAINT community_id_unique IF NOT EXISTS FOR (com:Community) REQUIRE com.id IS UNIQUE",
             ]
             with self._driver.session() as session:
                 for stmt in statements:
@@ -200,7 +201,7 @@ class Neo4jClient:
                 types_str = "|".join(relation_types)
                 rel_filter = f"[r:{types_str}]"
             else:
-                rel_filter = "[r:RELATED_TO|DEPENDS_ON|CONTRADICTS|DERIVED_FROM]"
+                rel_filter = "[r:RELATED_TO|DEPENDS_ON|CONTRADICTS|DERIVED_FROM|USES|PART_OF|IMPROVES|PROPOSED_BY]"
 
             params: Dict[str, Any] = {"limit": limit_nodes}
             coll_match = ""

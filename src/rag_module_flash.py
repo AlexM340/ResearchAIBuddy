@@ -8,6 +8,7 @@ import json
 import time
 import hashlib
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Union
@@ -86,12 +87,20 @@ except Exception:
     STORAGE_AVAILABLE = False
 
 try:
-    from graph import Neo4jClient, GraphIngestionService, GraphQueryService
+    from graph import (
+        Neo4jClient,
+        GraphIngestionService,
+        GraphQueryService,
+        NODE_TYPES,
+        ALLOWED_RELATIONS as GRAPH_ALLOWED_RELATIONS,
+    )
     GRAPH_AVAILABLE = True
 except Exception:
     Neo4jClient = None
     GraphIngestionService = None
     GraphQueryService = None
+    NODE_TYPES = set()
+    GRAPH_ALLOWED_RELATIONS = set()
     GRAPH_AVAILABLE = False
 
 try:
@@ -162,7 +171,8 @@ class RAGConfig:
     decision_extraction_enabled: bool = True
     graph_max_hops: int = 2
     graph_min_confidence: float = 0.70
-    graph_extraction_mode: str = "heuristic_fallback"
+    graph_extraction_mode: str = "llm_structured"
+    graph_extraction_batch_size: int = 5  # chunks per LLM call (free tier: fewer requests)
     memory_consolidation_enabled: bool = True
     memory_decay_days: int = 90
     db_primary_strict: bool = True
@@ -1404,6 +1414,16 @@ class CerebrumAISystem:
         
         # Cache unificat: expune acelasi API peste diskcache sau fallback in-memory.
         self.cache_manager = ResponseCache() if config.cache_enabled else None
+
+        # Cache persistent pentru extractia de graf (Phase 4): evita re-apelarea
+        # LLM-ului pentru chunk-uri identice (keyed pe hash text + model + ontologie).
+        self.graph_extraction_cache = None
+        if DISKCACHE_AVAILABLE:
+            try:
+                self.graph_extraction_cache = Cache("./data/cache/graph_extraction_cache")
+            except Exception as exc:
+                logger.warning("Graph extraction cache init failed: %s", exc)
+                self.graph_extraction_cache = None
         
         self.document_processor = SimpleDocumentProcessor(config)
         self.retriever = SimpleRetriever(config)
@@ -1454,6 +1474,9 @@ class CerebrumAISystem:
                     min_confidence=config.graph_min_confidence,
                     extraction_mode=config.graph_extraction_mode,
                     structured_extractor=self._extract_graph_structure_with_llm,
+                    embedder=lambda text: self._embed_note_text("", text),
+                    batch_extractor=self._extract_graph_structure_batch,
+                    extraction_batch_size=config.graph_extraction_batch_size,
                 )
                 self.graph_query = GraphQueryService(
                     self.neo4j_client,
@@ -1547,10 +1570,10 @@ class CerebrumAISystem:
                     storage_embeddings,
                 )
 
-            # Ingestie incrementală în graf (offline-style).
-            if self.graph_ingestion and self.graph_ingestion.enabled:
-                self.graph_ingestion.ingest_chunks(processed_docs)
-            
+            # Ingestie incrementală în graf, pe un thread separat (Phase 4):
+            # extractia LLM per chunk e lenta, asa ca upload-ul nu o mai asteapta.
+            self._ingest_graph_async(processed_docs)
+
             self.stats["documents_indexed"] = len(processed_docs)
             
             end_time = time.time()
@@ -1857,6 +1880,58 @@ RĂSPUNS:"""
                 return None
         return None
 
+    def _ingest_graph_async(self, processed_docs: List[Dict[str, Any]]) -> None:
+        """Ruleaza ingestia in graf pe un thread separat (Phase 4).
+
+        Extractia LLM per chunk e lenta + rate-limited; rulata in fundal, upload-ul
+        documentelor revine rapid. Esecurile sunt logate, nu propagate.
+        """
+        if not (self.graph_ingestion and self.graph_ingestion.enabled) or not processed_docs:
+            return
+
+        def _run() -> None:
+            try:
+                self.graph_ingestion.ingest_chunks(processed_docs)
+            except Exception as exc:
+                logger.warning("Background graph ingestion failed: %s", exc)
+
+        threading.Thread(target=_run, daemon=True, name="graph-ingest").start()
+
+    def rebuild_graph_communities(self, max_communities: int = 12) -> Dict[str, Any]:
+        """Detecteaza comunitati de concepte si genereaza rezumate (Phase 4).
+
+        Foloseste summarizer-ul LLM al sistemului; degradeaza la etichete simple
+        daca LLM-ul nu e disponibil.
+        """
+        if not (self.graph_ingestion and self.graph_ingestion.enabled):
+            return {"error": "graph_unavailable"}
+        return self.graph_ingestion.rebuild_communities(
+            summarizer=self._summarize_community,
+            max_communities=max_communities,
+        )
+
+    def _summarize_community(self, members: List[str], descriptions: List[str]) -> str:
+        """Rezuma o comunitate de concepte intr-o eticheta scurta (1 propozitie)."""
+        if not members:
+            return ""
+        members_str = ", ".join(members[:25])
+        context = " ".join(d for d in descriptions[:10] if d)[:1000]
+        prompt = (
+            "Rezuma in maxim o propozitie tema comuna a acestor concepte legate. "
+            "Returneaza doar propozitia, fara explicatii.\n"
+            f"Concepte: {members_str}\n"
+            f"Context: {context}\n\nTema:"
+        )
+        try:
+            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.add_request()
+            raw = self.llm.generate(prompt)
+            self.stats["llm_calls"] += 1
+            return (raw or "").strip()[:300]
+        except Exception:
+            # Fallback fara LLM: eticheta din primele concepte.
+            return ", ".join(members[:3])
+
     def _extract_graph_structure_with_llm(self, text: str) -> Dict[str, Any]:
         """
         Structured concept/relation extraction for GraphRAG ingestion.
@@ -1870,21 +1945,47 @@ RĂSPUNS:"""
             return {"concepts": [], "relations": []}
 
         snippet = text[:2500]
+        node_types = "|".join(sorted(NODE_TYPES)) or "Concept"
+        relation_types = "|".join(sorted(GRAPH_ALLOWED_RELATIONS)) or "RELATED_TO"
         prompt = (
-            "Extract a compact knowledge graph from the text.\n"
-            "Return STRICT JSON only (no markdown, no explanations).\n"
+            "You are a knowledge-graph extractor. Extract a compact, MEANINGFUL graph "
+            "from the text, following a closed ontology. Return STRICT JSON only "
+            "(no markdown, no prose).\n\n"
+            "Ontology:\n"
+            f"- Entity types: {node_types} (use 'Concept' only if nothing fits).\n"
+            f"- Relation types: {relation_types}.\n\n"
             "Schema:\n"
             "{\n"
-            '  "concepts": [{"name": "string", "confidence": 0.0}],\n'
-            '  "relations": [{"source": "string", "target": "string", "type": "RELATED_TO|DEPENDS_ON|CONTRADICTS|DERIVED_FROM", "confidence": 0.0}]\n'
-            "}\n"
+            '  "concepts": [{"name": "string", "type": "<EntityType>", '
+            '"aliases": ["string"], "description": "<=15 words grounded in text", "confidence": 0.0}],\n'
+            '  "relations": [{"source": "string", "target": "string", '
+            '"type": "<RelationType>", "evidence": "verbatim sentence/phrase from text", "confidence": 0.0}]\n'
+            "}\n\n"
             "Rules:\n"
-            "- Max 12 concepts and max 16 relations.\n"
-            "- Use concise canonical names.\n"
-            "- confidence must be in [0,1].\n"
-            "- Only include relations grounded in text.\n"
+            "- Entities must be real concepts/things/people/methods — NOT generic filler words "
+            "(e.g. skip 'system', 'based', 'approach', 'using').\n"
+            "- Prefer concise canonical multi-word names; put surface variants/acronyms in 'aliases'.\n"
+            "- Only emit a relation if it is explicitly supported by the text; put the supporting "
+            "sentence in 'evidence'. Do NOT invent relations from mere co-occurrence.\n"
+            "- 'type' must be from the ontology; if unsure use 'Concept'/'RELATED_TO'.\n"
+            "- confidence in [0,1] reflects how clearly the text supports it.\n"
+            "- Max 12 concepts and max 16 relations.\n\n"
             f"TEXT:\n{snippet}"
         )
+        # Cache persistent pe (model + ontologie + text) — chunk-uri identice nu
+        # mai cheltuie un apel LLM la re-ingestie/rebuild (Phase 4).
+        cache = self.graph_extraction_cache
+        cache_key: Optional[str] = None
+        if cache is not None:
+            signature = f"{self.llm.model_name}|{node_types}|{relation_types}|{snippet}"
+            cache_key = "graphx:" + hashlib.sha256(signature.encode("utf-8")).hexdigest()
+            try:
+                cached = cache.get(cache_key)
+            except Exception:
+                cached = None
+            if isinstance(cached, dict):
+                return cached
+
         try:
             self.rate_limiter.wait_if_needed()
             self.rate_limiter.add_request()
@@ -1897,10 +1998,115 @@ RĂSPUNS:"""
                 concepts = []
             if not isinstance(relations, list):
                 relations = []
-            return {"concepts": concepts, "relations": relations}
+            result = {"concepts": concepts, "relations": relations}
+            if cache is not None and cache_key is not None and (concepts or relations):
+                try:
+                    cache.set(cache_key, result)
+                except Exception:
+                    pass
+            return result
         except Exception as exc:
             logger.warning("LLM graph extraction failed: %s", exc)
             return {"concepts": [], "relations": []}
+
+    def _extract_graph_structure_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Extrage graful pentru MAI MULTE chunk-uri intr-un SINGUR apel LLM.
+
+        Esential pe free tier: reduce numarul de request-uri de N ori. Pastreaza
+        cache-ul per-text (chunk-urile deja procesate nu reapeleaza LLM-ul) si
+        aliniaza rezultatele 1:1 cu textele de intrare.
+        """
+        if not texts or not self.config.enable_graph_rag:
+            return [{"concepts": [], "relations": []} for _ in texts]
+
+        node_types = "|".join(sorted(NODE_TYPES)) or "Concept"
+        relation_types = "|".join(sorted(GRAPH_ALLOWED_RELATIONS)) or "RELATED_TO"
+
+        results: List[Optional[Dict[str, Any]]] = [None] * len(texts)
+        cache = self.graph_extraction_cache
+        keys: List[Optional[str]] = [None] * len(texts)
+        pending: List[int] = []
+
+        # 1. Serveste din cache ce se poate (per text).
+        for i, text in enumerate(texts):
+            snippet = (text or "")[:2500]
+            if cache is not None:
+                sig = f"{self.llm.model_name}|{node_types}|{relation_types}|{snippet}"
+                keys[i] = "graphx:" + hashlib.sha256(sig.encode("utf-8")).hexdigest()
+                try:
+                    cached = cache.get(keys[i])
+                except Exception:
+                    cached = None
+                if isinstance(cached, dict):
+                    results[i] = cached
+                    continue
+            pending.append(i)
+
+        # 2. Un singur apel LLM pentru tot lotul ramas.
+        if pending:
+            passages = "\n\n".join(
+                f"[{local}]\n{(texts[i] or '')[:2500]}" for local, i in enumerate(pending)
+            )
+            prompt = (
+                "You extract a knowledge graph from EACH labeled passage independently, "
+                "following a closed ontology. Return STRICT JSON only (no markdown, no prose).\n\n"
+                "Ontology:\n"
+                f"- Entity types: {node_types} (use 'Concept' only if nothing fits).\n"
+                f"- Relation types: {relation_types}.\n\n"
+                "Output schema:\n"
+                '{"items": [{"i": <passage index>, '
+                '"concepts": [{"name":"string","type":"<EntityType>","aliases":["string"],'
+                '"description":"<=15 words grounded in text","confidence":0.0}], '
+                '"relations": [{"source":"string","target":"string","type":"<RelationType>",'
+                '"evidence":"verbatim phrase from that passage","confidence":0.0}]}]}\n\n'
+                "Rules:\n"
+                "- Exactly one item per passage; copy the bracket number into 'i'.\n"
+                "- Entities must be real concepts/things/people/methods — NOT generic filler "
+                "(skip 'system','based','approach','using').\n"
+                "- Prefer canonical multi-word names; acronyms/variants go in 'aliases'.\n"
+                "- Only emit a relation explicitly supported by THAT passage; put the supporting "
+                "phrase in 'evidence'. No co-occurrence guesses.\n"
+                "- Max 10 concepts and 12 relations per passage. confidence in [0,1].\n\n"
+                f"PASSAGES:\n{passages}"
+            )
+            try:
+                self.rate_limiter.wait_if_needed()
+                self.rate_limiter.add_request()
+                raw = self.llm.generate(prompt)
+                self.stats["llm_calls"] += 1
+                parsed = self._extract_json_object(raw) or {}
+                items = parsed.get("items", []) if isinstance(parsed, dict) else []
+            except Exception as exc:
+                logger.warning("Batch graph extraction LLM call failed: %s", exc)
+                items = []
+
+            by_index: Dict[int, Dict[str, Any]] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    local = int(item.get("i"))
+                except (TypeError, ValueError):
+                    continue
+                by_index[local] = {
+                    "concepts": item.get("concepts", []) or [],
+                    "relations": item.get("relations", []) or [],
+                }
+
+            for local, i in enumerate(pending):
+                payload = by_index.get(local, {"concepts": [], "relations": []})
+                results[i] = payload
+                if (
+                    cache is not None
+                    and keys[i] is not None
+                    and (payload.get("concepts") or payload.get("relations"))
+                ):
+                    try:
+                        cache.set(keys[i], payload)
+                    except Exception:
+                        pass
+
+        return [r if isinstance(r, dict) else {"concepts": [], "relations": []} for r in results]
 
     def _run_vector_retrieval(
         self,
@@ -3918,6 +4124,32 @@ INSTRUCȚIUNI:
         if self.neo4j_client and self.neo4j_client.enabled:
             return self.neo4j_client.get_contradictions(limit=limit, include_dismissed=include_dismissed)
         return []
+
+    # ------------------------------------------------------------------
+    # Graph governance wrappers (Phase 3): revizuire / curatare graf
+    # ------------------------------------------------------------------
+
+    def graph_list_low_confidence_relations(
+        self, threshold: float = 0.78, limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        if self.graph_ingestion and self.graph_ingestion.enabled:
+            return self.graph_ingestion.list_low_confidence_relations(threshold=threshold, limit=limit)
+        return []
+
+    def graph_delete_relation(self, source: str, target: str, relation_type: str) -> bool:
+        if self.graph_ingestion and self.graph_ingestion.enabled:
+            return self.graph_ingestion.delete_relation(source, target, relation_type)
+        return False
+
+    def graph_list_concepts(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if self.graph_ingestion and self.graph_ingestion.enabled:
+            return self.graph_ingestion.list_concepts(limit=limit)
+        return []
+
+    def graph_merge_concepts(self, from_name: str, into_name: str) -> bool:
+        if self.graph_ingestion and self.graph_ingestion.enabled:
+            return self.graph_ingestion.merge_concepts(from_name, into_name)
+        return False
 
     def list_recent_decisions(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Returns most recent decisions for memory surfacing."""

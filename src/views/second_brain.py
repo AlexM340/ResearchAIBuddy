@@ -261,6 +261,8 @@ def _render_sidebar_tools(apci_system) -> Optional[str]:
         requested = "analysis"
     if st.button("🔎 Sugestii surse", use_container_width=True, key="sb_tool_suggestions"):
         requested = "suggestions"
+    if st.button("🧹 Curata graful", use_container_width=True, key="sb_tool_graph_cleanup"):
+        requested = "graph_cleanup"
     return requested
 
 
@@ -277,6 +279,8 @@ def _open_tool_dialog(tool: Optional[str], apci_system) -> None:
         _dialog_analysis(apci_system)
     elif tool == "suggestions":
         _dialog_suggestions()
+    elif tool == "graph_cleanup":
+        _dialog_graph_cleanup(apci_system)
 
 
 @st.dialog("📥 Inbox memorie", width="large")
@@ -314,6 +318,76 @@ def _dialog_analysis(apci_system) -> None:
 @st.dialog("🔎 Sugestii surse", width="large")
 def _dialog_suggestions() -> None:
     render_source_suggestions(topic_collection=None)
+
+
+@st.dialog("🧹 Curata graful", width="large")
+def _dialog_graph_cleanup(apci_system) -> None:
+    """Revizuire graf: sterge muchii slabe + uneste concepte duplicate (Phase 3)."""
+    neo4j_client = getattr(apci_system, "neo4j_client", None)
+    if not neo4j_client or not getattr(neo4j_client, "enabled", False):
+        st.info("Neo4j nu este disponibil — curatarea grafului e dezactivata.")
+        return
+
+    st.markdown("#### Muchii cu incredere scazuta")
+    st.caption("Relatii slab sustinute de text. Sterge-le pe cele care nu au sens.")
+    threshold = st.slider(
+        "Prag incredere", min_value=0.50, max_value=0.90, value=0.78, step=0.02,
+        key="graph_clean_threshold",
+    )
+    try:
+        rels = apci_system.graph_list_low_confidence_relations(threshold=threshold, limit=30) or []
+    except Exception:
+        rels = []
+
+    if not rels:
+        st.success("Nicio muchie sub prag. Graful arata curat.")
+    else:
+        for idx, rel in enumerate(rels):
+            with st.container(border=True):
+                st.markdown(f"**{rel['source']}** —[{rel['type']}]→ **{rel['target']}**")
+                st.caption(f"incredere {rel['confidence']:.2f} · {rel['observations']} observatii")
+                if rel.get("evidence"):
+                    st.caption(f"„{rel['evidence'][:200]}”")
+                if st.button("Sterge muchia", key=f"graph_del_{idx}", use_container_width=True):
+                    if apci_system.graph_delete_relation(rel["source"], rel["target"], rel["type"]):
+                        invalidate_reads()
+                        st.success("Muchie stearsa.")
+                        st.rerun()
+                    else:
+                        st.error("Stergere esuata.")
+
+    st.divider()
+    st.markdown("#### Comunitati de concepte")
+    st.caption("Grupeaza conceptele conectate si genereaza un rezumat per grup (teme).")
+    if st.button("Reconstruieste comunitatile", use_container_width=True, key="graph_communities_btn"):
+        with st.spinner("Detectez comunitati si generez rezumate..."):
+            result = apci_system.rebuild_graph_communities()
+        if result.get("error"):
+            st.warning(result["error"])
+        else:
+            st.success(
+                f"{result.get('communities', 0)} comunitati, "
+                f"{result.get('summarized', 0)} rezumate."
+            )
+
+    st.divider()
+    st.markdown("#### Uneste concepte duplicate")
+    st.caption("Muta toate muchiile de la un concept la altul (ex. 'ml' → 'machine learning').")
+    col_from, col_into = st.columns(2)
+    with col_from:
+        from_name = st.text_input("Concept sursa (dispare)", key="graph_merge_from")
+    with col_into:
+        into_name = st.text_input("Concept tinta (ramane)", key="graph_merge_into")
+    if st.button("Uneste conceptele", type="primary", use_container_width=True, key="graph_merge_btn"):
+        if from_name.strip() and into_name.strip():
+            if apci_system.graph_merge_concepts(from_name.strip(), into_name.strip()):
+                invalidate_reads()
+                st.success(f"„{from_name}” unit in „{into_name}”.")
+                st.rerun()
+            else:
+                st.error("Unirea a esuat (verifica numele exacte ale conceptelor).")
+        else:
+            st.warning("Completeaza ambele concepte.")
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,8 @@
         "temperature": 0.1,
         "max_tokens": 65536,
         "rate_limits": {
-            "requests_per_minute": 30,
-            "requests_per_day": 3000
+            "requests_per_minute": 60,
+            "requests_per_day": 10000
         }
     },
     "vector_db": {
@@ -69,7 +69,8 @@
         "decision_extraction_enabled": true,
         "graph_max_hops": 2,
         "graph_min_confidence": 0.7,
-        "graph_extraction_mode": "heuristic_fallback",
+        "graph_extraction_mode": "llm_structured",
+        "graph_extraction_batch_size": 12,
         "memory_consolidation_enabled": true,
         "memory_decay_days": 90,
         "db_primary_strict": true,
