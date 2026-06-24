@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +84,8 @@ class SecondBrainRepository:
         collection_name: str,
         source_path: str,
         indexed: bool = False,
+        file_size: int = 0,
+        file_type: str = "",
     ) -> Optional[int]:
         if not self.enabled:
             return None
@@ -99,17 +102,19 @@ class SecondBrainRepository:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO documents(file_hash, original_name, collection_id, source_path, indexed, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                        INSERT INTO documents(file_hash, original_name, collection_id, source_path, indexed, file_size, file_type, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                         ON CONFLICT(file_hash) DO UPDATE SET
                             original_name = EXCLUDED.original_name,
                             collection_id = EXCLUDED.collection_id,
                             source_path = EXCLUDED.source_path,
                             indexed = EXCLUDED.indexed,
+                            file_size = EXCLUDED.file_size,
+                            file_type = EXCLUDED.file_type,
                             updated_at = NOW()
                         RETURNING id;
                         """,
-                        (file_hash, original_name, collection_id, source_path, indexed),
+                        (file_hash, original_name, collection_id, source_path, indexed, int(file_size or 0), (file_type or "")),
                     )
                     row = cur.fetchone()
                 conn.commit()
@@ -214,6 +219,7 @@ class SecondBrainRepository:
                 first_meta = source_chunks[0].get("metadata", {})
                 doc_name = first_meta.get("filename") or source_path.split("\\")[-1].split("/")[-1]
                 collection = first_meta.get("collection", "general")
+                file_size, file_type = self._file_meta(source_path, doc_name)
 
                 doc_id = self.upsert_document(
                     file_hash=file_hash,
@@ -221,6 +227,8 @@ class SecondBrainRepository:
                     collection_name=collection,
                     source_path=source_path,
                     indexed=True,
+                    file_size=file_size,
+                    file_type=file_type,
                 )
                 if doc_id is None:
                     continue
@@ -3365,7 +3373,8 @@ class SecondBrainRepository:
                     cur.execute(
                         """
                         SELECT d.id, d.file_hash, d.original_name, d.source_path,
-                               d.indexed, d.created_at, d.updated_at
+                               d.indexed, d.created_at, d.updated_at,
+                               COALESCE(d.file_size, 0), COALESCE(d.file_type, '')
                         FROM documents d
                         JOIN collections c ON c.id = d.collection_id
                         WHERE c.name = %s
@@ -3384,6 +3393,8 @@ class SecondBrainRepository:
                     "indexed": bool(row[4]),
                     "created_at": row[5].isoformat() if row[5] else "",
                     "updated_at": row[6].isoformat() if row[6] else "",
+                    "file_size": int(row[7] or 0),
+                    "file_type": row[8] or "",
                 }
                 for row in rows
             ]
@@ -3459,6 +3470,58 @@ class SecondBrainRepository:
             for chunk in iter(lambda: file_handle.read(4096), b""):
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
+
+    @staticmethod
+    def _file_meta(source_path: str, name: str = "") -> tuple:
+        """Return (file_size_bytes, file_type_suffix) for a document path.
+
+        Degrades gracefully: size 0 when the file is unavailable (e.g. on an
+        ephemeral filesystem after the upload session ended).
+        """
+        suffix = os.path.splitext(name or source_path or "")[1].lower()
+        size = 0
+        try:
+            size = int(os.path.getsize(source_path))
+        except Exception:
+            size = 0
+        return size, suffix
+
+    def delete_document(self, document_id: int) -> bool:
+        """Delete a document and its chunks/embeddings (FK ON DELETE CASCADE)."""
+        if not self.enabled:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM documents WHERE id = %s;", (int(document_id),))
+                    deleted = cur.rowcount
+                conn.commit()
+            return bool(deleted)
+        except Exception as exc:
+            logger.error("delete_document failed for id=%s: %s", document_id, exc)
+            return False
+
+    def delete_collection_by_name(self, collection_name: str) -> bool:
+        """Delete a collection and all its documents/chunks (FK ON DELETE CASCADE)."""
+        if not self.enabled:
+            return False
+        name = (collection_name or "").strip()
+        if not name:
+            return False
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return False
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM collections WHERE name = %s;", (name,))
+                    deleted = cur.rowcount
+                conn.commit()
+            return bool(deleted)
+        except Exception as exc:
+            logger.error("delete_collection_by_name failed for %s: %s", name, exc)
+            return False
 
     @staticmethod
     def _tokenize_query_terms(question: str) -> List[str]:

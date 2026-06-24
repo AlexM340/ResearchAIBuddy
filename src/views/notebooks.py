@@ -12,6 +12,8 @@ import streamlit as st
 
 from views._collections import (
     create_notebook,
+    delete_document,
+    delete_notebook,
     get_notebook_collections,
     get_notebook_documents,
 )
@@ -143,7 +145,7 @@ def _render_notebook_card(name: str, info: Dict[str, Any]) -> None:
             if st.session_state.get(confirm_key):
                 if st.button("Confirma", key=f"nb_delete_ok_{name}", use_container_width=True, type="secondary"):
                     dm = st.session_state.get("document_manager")
-                    if dm and dm.delete_collection(name):
+                    if delete_notebook(name, dm):
                         st.session_state.pop(confirm_key, None)
                         st.rerun()
             else:
@@ -461,7 +463,7 @@ def _render_notebook_sources(notebook_name: str, docs: List[Dict[str, Any]]) -> 
 
                 if st.button("Sterge", key=f"nb_del_{doc['id']}", use_container_width=True):
                     document_manager = st.session_state.get("document_manager")
-                    if document_manager and document_manager.remove_document(doc["id"]):
+                    if delete_document(doc, document_manager):
                         st.success("Document sters.")
                         st.rerun()
 

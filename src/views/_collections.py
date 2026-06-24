@@ -1,10 +1,9 @@
 """Helpers pentru colectiile (notebook-urile) afisate in pagina Notebooks.
 
-Istoric, lista de notebook-uri venea DOAR din biblioteca locala JSON
-(`DocumentManager`), care e per-masina si nu e partajata cu deploy-ul Streamlit.
-Aceste functii prefera Postgres (sursa de adevar partajata) si fac merge cu
-biblioteca locala, ca sa nu se piarda nimic si ca acelasi notebook sa fie vizibil
-si local, si pe Streamlit, atat timp cat ambele instante folosesc aceeasi baza.
+Postgres este sursa de adevar pentru ce se afiseaza (colectii, documente, flag
+`indexed`, marime, tip). Biblioteca locala `DocumentManager` ramane doar zona de
+staging pentru fisiere la upload/indexare (invizibila in UI) si serveste ca
+fallback de citire DOAR cand Postgres nu e disponibil.
 """
 
 from __future__ import annotations
@@ -27,84 +26,96 @@ def _get_repository():
 def _adapt_db_document(row: Dict[str, Any]) -> Dict[str, Any]:
     """Mapeaza un rand din `documents` (Postgres) la forma asteptata de UI."""
     name = row.get("original_name", "") or row.get("source_path", "")
-    suffix = PurePath(name).suffix.lower()
+    file_type = row.get("file_type") or PurePath(name).suffix.lower()
     return {
-        # Prefix 'pg_' marcheaza un document care exista doar in Postgres (nu si
-        # in biblioteca locala) — stergerea din UI il ignora elegant (vezi nota).
-        "id": f"pg_{row.get('id')}",
-        "original_name": row.get("original_name", "") or "fara nume",
+        "id": row.get("id"),  # id real din Postgres (int) — folosit la stergere
+        "original_name": name or "fara nume",
         "source_path": row.get("source_path", ""),
         "file_hash": row.get("file_hash", ""),
-        "file_type": suffix,
-        "file_size": 0,
+        "file_type": file_type,
+        "file_size": int(row.get("file_size", 0) or 0),
         "indexed": bool(row.get("indexed", False)),
         "added_date": row.get("created_at", "") or "",
-        "collection": "",
         "_origin": "postgres",
     }
 
 
 def get_notebook_collections(document_manager) -> Dict[str, Dict[str, Any]]:
-    """Merge intre colectiile din Postgres (partajat) si biblioteca locala."""
-    merged: Dict[str, Dict[str, Any]] = {}
-    if document_manager:
-        for name, info in (document_manager.get_collections() or {}).items():
-            merged[name] = dict(info)
-
+    """Colectiile din Postgres (sursa de adevar). Fallback la local doar daca DB e jos."""
     repository = _get_repository()
     if repository is not None:
+        merged: Dict[str, Dict[str, Any]] = {}
         for col in repository.list_collections():
             name = (col.get("name") or "").strip()
             if not name:
                 continue
-            entry = merged.setdefault(name, {"name": name, "documents": []})
-            entry["name"] = name
-            entry["document_count"] = col.get("document_count", entry.get("document_count"))
-            entry["indexed_count"] = col.get("indexed_count")
-    return merged
+            merged[name] = {
+                "name": name,
+                "document_count": col.get("document_count", 0),
+                "indexed_count": col.get("indexed_count", 0),
+            }
+        return merged
+
+    # Fallback: Postgres indisponibil -> biblioteca locala.
+    if document_manager:
+        return dict(document_manager.get_collections() or {})
+    return {}
 
 
 def get_notebook_documents(collection_name: str, document_manager) -> List[Dict[str, Any]]:
-    """Merge intre documentele unei colectii din Postgres (partajat) + local.
-
-    Deduplicarea se face pe `file_hash`; randurile locale au prioritate fiindca
-    pastreaza metadate mai bogate (file_size, file_type, id local pentru stergere).
-    """
-    docs: List[Dict[str, Any]] = []
-    seen_hashes: set = set()
-
-    if document_manager:
-        for doc in document_manager.get_documents_by_collection(collection_name) or []:
-            docs.append(doc)
-            file_hash = doc.get("file_hash")
-            if file_hash:
-                seen_hashes.add(file_hash)
-
+    """Documentele unei colectii din Postgres. Fallback la local doar daca DB e jos."""
     repository = _get_repository()
     if repository is not None:
-        for row in repository.list_documents_by_collection(collection_name):
-            file_hash = row.get("file_hash")
-            if file_hash and file_hash in seen_hashes:
-                continue
-            docs.append(_adapt_db_document(row))
-            if file_hash:
-                seen_hashes.add(file_hash)
-    return docs
+        return [_adapt_db_document(row) for row in repository.list_documents_by_collection(collection_name)]
+
+    if document_manager:
+        return list(document_manager.get_documents_by_collection(collection_name) or [])
+    return []
 
 
 def create_notebook(name: str, document_manager) -> bool:
-    """Creeaza un notebook in biblioteca locala SI in Postgres (partajat).
-
-    Idempotent: daca exista deja intr-una din surse, il asigura in cealalta si
-    raporteaza succes, ca sa nu apara fals 'Nu am putut crea notebook-ul'.
-    """
+    """Creeaza un notebook in Postgres (sursa de adevar) + local (staging)."""
     created = False
-    if document_manager:
-        # create_collection -> False daca exista deja local; acceptabil.
-        created = bool(document_manager.create_collection(name))
-
     repository = _get_repository()
     if repository is not None:
         collection_id = repository.upsert_collection(name, collection_type="topic")
-        created = created or (collection_id is not None)
+        created = collection_id is not None
+
+    if document_manager:
+        # Asigura colectia local ca tinta de staging pentru upload-uri viitoare.
+        local_created = bool(document_manager.create_collection(name))
+        created = created or local_created
     return created
+
+
+def delete_notebook(name: str, document_manager) -> bool:
+    """Sterge notebook-ul din Postgres (+ documente/chunks prin CASCADE) si local."""
+    deleted = False
+    repository = _get_repository()
+    if repository is not None:
+        deleted = repository.delete_collection_by_name(name)
+
+    if document_manager:
+        local_deleted = bool(document_manager.delete_collection(name))
+        deleted = deleted or local_deleted
+    return deleted
+
+
+def delete_document(doc: Dict[str, Any], document_manager) -> bool:
+    """Sterge un document din Postgres dupa id (+ chunks prin CASCADE) si local dupa hash."""
+    deleted = False
+    doc_id = doc.get("id")
+    file_hash = doc.get("file_hash")
+
+    repository = _get_repository()
+    if repository is not None and isinstance(doc_id, int):
+        deleted = repository.delete_document(doc_id)
+
+    # Curata si copia locala de staging (daca exista), identificata prin hash.
+    if document_manager and file_hash:
+        for local_id, info in (document_manager.get_all_documents() or {}).items():
+            if info.get("file_hash") == file_hash:
+                document_manager.remove_document(local_id)
+                deleted = True
+                break
+    return deleted

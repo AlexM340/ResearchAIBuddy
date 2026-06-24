@@ -120,13 +120,15 @@ def main() -> int:
         # Biblioteca locala nu pastreaza source_path absolut; folosim library_path.
         source_path = info.get("source_path") or info.get("library_path") or name
         indexed = bool(info.get("indexed", False))
+        file_size = int(info.get("file_size", 0) or 0)
+        file_type = info.get("file_type", "") or ""
 
         if not file_hash:
             print(f"  SKIP (fara file_hash): {name}")
             doc_fail += 1
             continue
         if args.dry_run:
-            print(f"  document: {name} -> {collection} (indexed={indexed})")
+            print(f"  document: {name} -> {collection} (indexed={indexed}, {file_size} bytes)")
             doc_ok += 1
             continue
 
@@ -136,6 +138,8 @@ def main() -> int:
             collection_name=collection,
             source_path=source_path,
             indexed=indexed,
+            file_size=file_size,
+            file_type=file_type,
         )
         if new_id is not None:
             doc_ok += 1
