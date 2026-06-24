@@ -51,7 +51,7 @@
         "enable_reranker": true,
         "reranker_model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
         "reranker_input_k": 20,
-        "enable_hyde": false,
+        "enable_hyde": true,
         "hyde_max_tokens": 200
     },
     "web_search": {

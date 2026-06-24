@@ -10,6 +10,11 @@ from typing import Any, Dict, List
 
 import streamlit as st
 
+from views._collections import (
+    create_notebook,
+    get_notebook_collections,
+    get_notebook_documents,
+)
 from views._documents import process_uploaded_files, save_text_as_document
 from views._shared import (
     DEFAULT_CHAT_TITLE,
@@ -66,7 +71,7 @@ def _render_notebooks_list() -> None:
     )
 
     document_manager = st.session_state.get("document_manager")
-    collections = document_manager.get_collections() if document_manager else {}
+    collections = get_notebook_collections(document_manager)
     notebook_names = sorted(
         [name for name in collections.keys() if not is_general_collection(name)]
     )
@@ -108,7 +113,7 @@ def _render_notebook_creator() -> None:
                 st.warning("Numele 'general' este rezervat pentru sursele globale.")
                 return
             document_manager = st.session_state.get("document_manager")
-            if document_manager and document_manager.create_collection(cleaned):
+            if create_notebook(cleaned, document_manager):
                 st.session_state.active_notebook = cleaned
                 st.success(f"Notebook-ul '{cleaned}' a fost creat.")
                 st.rerun()
@@ -118,7 +123,7 @@ def _render_notebook_creator() -> None:
 
 def _render_notebook_card(name: str, info: Dict[str, Any]) -> None:
     document_manager = st.session_state.get("document_manager")
-    docs = document_manager.get_documents_by_collection(name) if document_manager else []
+    docs = get_notebook_documents(name, document_manager)
     indexed_docs = sum(1 for d in docs if d.get("indexed", False))
 
     chat_count = _count_chats_for_notebook(name)
@@ -166,7 +171,7 @@ def _count_chats_for_notebook(name: str) -> int:
 
 def _render_open_notebook(notebook_name: str) -> None:
     document_manager = st.session_state.get("document_manager")
-    docs = document_manager.get_documents_by_collection(notebook_name) if document_manager else []
+    docs = get_notebook_documents(notebook_name, document_manager)
 
     header_left, header_right = st.columns([5, 1])
     with header_left:

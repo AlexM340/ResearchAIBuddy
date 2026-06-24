@@ -3308,6 +3308,89 @@ class SecondBrainRepository:
             logger.error("list_recent_documents failed: %s", exc)
             return []
 
+    def list_collections(self) -> List[Dict[str, Any]]:
+        """Return all collections with document counts (shared source of truth).
+
+        Used by the Notebooks view so notebooks persist in Postgres and are
+        visible across machines/deployments, not only in the local JSON library.
+        """
+        if not self.enabled:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            c.id, c.name, c.type, c.created_at,
+                            COUNT(d.id) AS doc_count,
+                            COUNT(d.id) FILTER (WHERE d.indexed) AS indexed_count
+                        FROM collections c
+                        LEFT JOIN documents d ON d.collection_id = c.id
+                        GROUP BY c.id, c.name, c.type, c.created_at
+                        ORDER BY c.name;
+                        """
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "name": row[1] or "",
+                    "type": row[2] or "topic",
+                    "created_at": row[3].isoformat() if row[3] else "",
+                    "document_count": int(row[4] or 0),
+                    "indexed_count": int(row[5] or 0),
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_collections failed: %s", exc)
+            return []
+
+    def list_documents_by_collection(self, collection_name: str) -> List[Dict[str, Any]]:
+        """Return documents of a collection from Postgres (shared source of truth)."""
+        if not self.enabled:
+            return []
+        name = (collection_name or "").strip()
+        if not name:
+            return []
+        try:
+            with self.client.connection() as conn:
+                if conn is None:
+                    return []
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT d.id, d.file_hash, d.original_name, d.source_path,
+                               d.indexed, d.created_at, d.updated_at
+                        FROM documents d
+                        JOIN collections c ON c.id = d.collection_id
+                        WHERE c.name = %s
+                        ORDER BY d.original_name;
+                        """,
+                        (name,),
+                    )
+                    rows = cur.fetchall() or []
+                conn.commit()
+            return [
+                {
+                    "id": int(row[0]),
+                    "file_hash": row[1] or "",
+                    "original_name": row[2] or "",
+                    "source_path": row[3] or "",
+                    "indexed": bool(row[4]),
+                    "created_at": row[5].isoformat() if row[5] else "",
+                    "updated_at": row[6].isoformat() if row[6] else "",
+                }
+                for row in rows
+            ]
+        except Exception as exc:
+            logger.error("list_documents_by_collection failed for %s: %s", name, exc)
+            return []
+
     def is_file_hash_indexed(self, file_hash: str) -> bool:
         """Return True when file hash exists and document is already indexed."""
         if not self.enabled:
