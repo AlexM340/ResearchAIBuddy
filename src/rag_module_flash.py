@@ -3715,6 +3715,7 @@ INSTRUCȚIUNI:
                                 "error": None,
                                 "citation_invalid": citation_validation["invalid"],
                                 "citation_used": citation_validation["used"],
+                                **self._retrieved_ids(selected_vector_docs, graph_sources),
                             },
                         )
 
@@ -3887,6 +3888,7 @@ INSTRUCȚIUNI:
                         "error": None,
                         "citation_invalid": citation_validation["invalid"],
                         "citation_used": citation_validation["used"],
+                        **self._retrieved_ids(selected_vector_docs, graph_sources),
                     },
                 )
             
@@ -4513,6 +4515,31 @@ INSTRUCȚIUNI:
             "episode": "Ep",
             "synthesis": "S",
         }.get((artifact_type or "").strip().lower(), "M")
+
+    @staticmethod
+    def _retrieved_ids(
+        selected_vector_docs: List[Dict[str, Any]],
+        graph_sources: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """ID-urile regasite, in ordine — necesare pentru Recall@k / MRR la evaluare."""
+        chunk_ids: List[Any] = []
+        doc_names: List[str] = []
+        for doc in selected_vector_docs or []:
+            meta = doc.get("metadata", {}) or {}
+            cid = meta.get("db_chunk_id")
+            if cid is not None:
+                chunk_ids.append(cid)
+            name = meta.get("filename") or meta.get("original_name") or ""
+            if name and name not in doc_names:
+                doc_names.append(name)
+        graph_chunk_ids = [
+            g.get("chunk_id") for g in (graph_sources or []) if g.get("chunk_id")
+        ]
+        return {
+            "retrieved_chunk_ids": chunk_ids,
+            "retrieved_document_ids": doc_names,
+            "graph_chunk_ids": graph_chunk_ids,
+        }
 
     @staticmethod
     def _validate_citations(

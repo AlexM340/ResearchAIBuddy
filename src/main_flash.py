@@ -582,6 +582,17 @@ def _render_quick_note_capture() -> None:
                     st.switch_page(notes_page)
 
 
+def _test_config_label(hyde: bool, reranker: bool, graph: bool) -> str:
+    """Eticheteaza combinatia de flaguri ca una din configuratiile de test A-D."""
+    presets = {
+        (False, False, False): "A — vector baseline",
+        (False, True, False): "B — vector + reranker",
+        (True, True, False): "C — HyDE + reranker",
+        (True, True, True): "D — complet",
+    }
+    return presets.get((bool(hyde), bool(reranker), bool(graph)), "Custom")
+
+
 def _render_settings_section() -> None:
     """Setari user-facing: web search implicit, cache, cheia API."""
     apci_system = st.session_state.get("apci_system")
@@ -604,6 +615,59 @@ def _render_settings_section() -> None:
             st.success("Setare actualizata.")
         except Exception:
             st.error("Nu am putut actualiza setarea.")
+
+    # --- Configuratie test (A/B/C/D) ---
+    # Flaguri de retrieval citite la fiecare query -> comutarea are efect imediat,
+    # fara restart. NU afecteaza ingestia/graful deja construite. 'Forteaza web'
+    # ramane per-intrebare in chat.
+    st.divider()
+    st.markdown("**Configurație test (retrieval)**")
+    cfg = apci_system.config
+
+    hyde = st.toggle(
+        "HyDE",
+        value=bool(getattr(cfg, "enable_hyde", False)),
+        key="test_enable_hyde",
+        help="Expansiunea interogarii printr-un pseudo-document (apel LLM suplimentar).",
+    )
+    reranker = st.toggle(
+        "Reranker",
+        value=bool(getattr(cfg, "enable_reranker", True)),
+        key="test_enable_reranker",
+        help="Reordonare cross-encoder a candidatilor.",
+    )
+    graph = st.toggle(
+        "Graph RAG",
+        value=bool(getattr(cfg, "enable_graph_rag", True)),
+        key="test_enable_graph_rag",
+        help="Retrieval din graf pe ruta hibrida. Nu atinge ingestia/graful deja facute.",
+    )
+
+    # Aplica pe configuratia live (efect la urmatoarea intrebare).
+    cfg.enable_hyde = bool(hyde)
+    cfg.enable_reranker = bool(reranker)
+    cfg.enable_graph_rag = bool(graph)
+
+    st.caption(f"Configurație activă: **{_test_config_label(hyde, reranker, graph)}**")
+
+    reranker_ready = bool(
+        getattr(apci_system, "reranker", None)
+        and getattr(apci_system.reranker, "available", False)
+    )
+    if reranker and not reranker_ready:
+        st.caption("⚠️ Rerankerul nu este disponibil (model neincarcat) — efect nul.")
+
+    if st.button(
+        "Golește response cache",
+        use_container_width=True,
+        key="test_clear_response_cache",
+        help="Ruleaza intre rulari identice ca fluxul sa se execute complet, nu din cache.",
+    ):
+        try:
+            apci_system.clear_cache()
+            st.success("Response cache golit.")
+        except Exception:
+            st.error("Nu am putut goli response cache-ul.")
 
     # Cache embeddings.
     try:
