@@ -70,7 +70,7 @@ class ContextBuilder:
                 graph_sources.append(item.source_ref)
 
         context_text = "\n\n".join(context_blocks)
-        prompt = f"""Ești un asistent personal de tip Second Brain.
+        prompt = f"""Ești un asistent personal de tip Second Brain. Răspunzi în limba întrebării, sintetizând informația din dovezile utilizatorului.
 
 CONTEXT DOVEZI:
 {context_text}
@@ -79,9 +79,12 @@ CONTEXT DOVEZI:
 {question}
 
 INSTRUCȚIUNI:
-- Răspunde strict pe baza dovezilor de mai sus.
-- Citează explicit dovezile folosite: [D#] pentru documente și [G#] pentru graf.
-- Dacă contextul este insuficient, răspunde exact: INSUFFICIENT_CONTEXT.
+- Folosește DOAR dovezile de mai sus; fără cunoștințe externe.
+- Prioritizează dovezile din documente [D#] și graf [G#] ca surse factuale. Memoria personală ([M#], [Ep#], [N#]) este context secundar (notițele tale anterioare) — nu o trata ca adevăr absolut și nu o cita ca sursă primară.
+- Ignoră dovezile irelevante sau de tip boilerplate; nu cita o dovadă doar pentru că apare în context.
+- Citează explicit fiecare afirmație cu marcajul potrivit: [D#] pentru documente, [G#] pentru graf.
+- Sintetizează coerent (nu copia fragmente brute); fii concis și structurat.
+- Dacă dovezile nu acoperă întrebarea, răspunde exact: INSUFFICIENT_CONTEXT.
 """
 
         return {

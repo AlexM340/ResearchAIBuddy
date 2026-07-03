@@ -650,6 +650,17 @@ def _render_settings_section() -> None:
 
     st.caption(f"Configurație activă: **{_test_config_label(hyde, reranker, graph)}**")
 
+    test_mode = st.toggle(
+        "Mod testare (fără memorie personală)",
+        value=bool(getattr(cfg, "test_mode", False)),
+        key="test_mode_toggle",
+        help="Scoate M#/N#/Ep# din context SI opreste capturarea de episoade/decizii/note. "
+             "Raspunsul se bazeaza strict pe documente+graf — recomandat pentru setul de retrieval.",
+    )
+    cfg.test_mode = bool(test_mode)
+    if test_mode:
+        st.caption("🧪 Memorie personală OPRITĂ (retrieval + capturare).")
+
     reranker_ready = bool(
         getattr(apci_system, "reranker", None)
         and getattr(apci_system.reranker, "available", False)

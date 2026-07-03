@@ -11,6 +11,32 @@ from .neo4j_client import Neo4jClient
 logger = logging.getLogger(__name__)
 
 
+# Markeri de "pagina de garda" / boilerplate editorial (copyright, contact,
+# ISBN, editori). Aceste chunk-uri ajung in graf la ingestie, dar nu au valoare
+# informationala -> le filtram la retrieval ca sa nu polueze contextul LLM.
+_BOILERPLATE_MARKERS = (
+    "all rights reserved",
+    "how to contact us",
+    "o'reilly media",
+    "o’reilly media",
+    "printed in the united states",
+    "for release details",
+    "revision history for",
+    "catalog/errata",
+    "development editor",
+    "production editor",
+    "cover designer",
+)
+
+
+def _is_boilerplate(text: str) -> bool:
+    """True pentru pagini de garda/editoriale care nu aduc continut util."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _BOILERPLATE_MARKERS)
+
+
 class GraphQueryService:
     """Read-only graph query service for relation-aware evidence retrieval."""
 
@@ -44,6 +70,10 @@ class GraphQueryService:
         OPTIONAL MATCH (ch)-[:SOURCED_FROM]->(d:Document)-[:ABOUT_TOPIC]->(t:Topic)
         OPTIONAL MATCH (art:Artifact)-[:MENTIONS]->(linked)
         OPTIONAL MATCH (art)-[:ABOUT_TOPIC]->(at:Topic)
+        // WITH obligatoriu: altfel WHERE-ul s-ar atasa de OPTIONAL MATCH-ul de mai
+        // sus (devine predicat al lui, nu filtru pe randuri) si scope-ul de topic
+        // n-ar mai filtra nimic -> s-ar scurge chunk-uri din alte colectii.
+        WITH seed, linked, p, ch, d, t, art, at
         WHERE ($topic = '' OR toLower(coalesce(t.name, at.name, '')) = toLower($topic))
         RETURN seed.name AS seed_concept,
                linked.name AS concept,
@@ -64,13 +94,27 @@ class GraphQueryService:
             {
                 "terms": terms,
                 "topic": active_collection or "",
-                "max_paths": int(max_paths),
+                # Oversample: cerem mai multe randuri ca sa avem rezerva dupa ce
+                # eliminam duplicatele si boilerplate-ul, fara sa ramanem cu prea putine.
+                "max_paths": int(max_paths) * 4,
                 "min_confidence": 0.70,
             },
         )
 
         graph_sources: List[Dict[str, Any]] = []
+        seen_keys: set = set()
         for row in rows:
+            chunk_text = row.get("chunk_text", "") or ""
+            # Sari peste pagini de garda / boilerplate editorial.
+            if _is_boilerplate(chunk_text):
+                continue
+            # Dedup pe chunk_id (sau pe prefixul textului cand chunk_id lipseste):
+            # acelasi chunk poate fi atins prin mai multe cai -> il pastram o data.
+            dedup_key = str(row.get("chunk_id") or "") or chunk_text[:200]
+            if dedup_key and dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
             relation_scores = [float(value) for value in (row.get("relation_scores") or [])]
             avg_conf = sum(relation_scores) / len(relation_scores) if relation_scores else 0.7
             hops = max(1, int(row.get("hops") or 1))

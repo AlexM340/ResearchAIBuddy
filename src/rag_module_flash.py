@@ -174,6 +174,11 @@ class RAGConfig:
     graph_extraction_mode: str = "llm_structured"
     graph_extraction_batch_size: int = 5  # chunks per LLM call (free tier: fewer requests)
     memory_consolidation_enabled: bool = True
+    # Mod testare (evaluare retrieval): dezactiveaza memoria personala — atat
+    # regasirea (M#/N#/Ep# nu mai intra in context), cat si capturarea (nicio
+    # intrebare nu mai e salvata ca episod/decizie/nota). Raspunsul se bazeaza
+    # strict pe documente + graf, fara auto-contaminare.
+    test_mode: bool = False
     memory_decay_days: int = 90
     db_primary_strict: bool = True
     ingestion_embedding_batch_size: int = 64
@@ -2218,6 +2223,16 @@ RĂSPUNS:"""
             "without explanation or preface.\n\n"
             f"Question: {question.strip()}\n\nPassage:"
         )
+        def _log_hyde(pseudo_doc: str) -> str:
+            # DEBUG: afiseaza in consola intrebarea si pseudo-documentul HyDE.
+            print(
+                "\n" + "-" * 80
+                + f"\n[HyDE] intrebare: {question.strip()}"
+                + f"\n[HyDE] pseudo-document generat:\n{pseudo_doc}\n" + "-" * 80,
+                flush=True,
+            )
+            return pseudo_doc
+
         try:
             self.rate_limiter.wait_if_needed()
             self.rate_limiter.add_request()
@@ -2226,12 +2241,12 @@ RĂSPUNS:"""
                 max_output_tokens=int(self.config.hyde_max_tokens),
             )
             self.stats["llm_calls"] += 1
-            return (raw or "").strip()
+            return _log_hyde((raw or "").strip())
         except TypeError:
             # llm.generate fara max_output_tokens
             try:
                 raw = self.llm.generate(prompt)
-                return (raw or "").strip()
+                return _log_hyde((raw or "").strip())
             except Exception as exc:
                 logger.warning("HyDE generation failed: %s", exc)
                 return ""
@@ -2335,21 +2350,21 @@ RĂSPUNS:"""
             prompt = self._create_rag_prompt(question, vector_docs[: self.config.max_context_docs])
             if memory_lines:
                 prompt += (
-                    "\n\nMEMORIE PERSONALĂ:\n"
+                    "\n\nMEMORIE PERSONALĂ (context secundar — notițele tale anterioare, NU surse primare):\n"
                     + "\n".join(memory_lines)
-                    + "\nFolosește citări [M#] când utilizezi memorie personală."
+                    + "\nFolosește-o doar dacă e relevantă; prioritizează documentele. Citează [M#] când o folosești."
                 )
             if note_lines:
                 prompt += (
-                    "\n\nNOTELE TALE PERSONALE:\n"
+                    "\n\nNOTELE TALE PERSONALE (context secundar):\n"
                     + "\n".join(note_lines)
-                    + "\nFolosește citări [N#] când utilizezi notele tale."
+                    + "\nSunt notițele tale, nu surse primare. Citează [N#] dacă le folosești."
                 )
             if artifact_lines:
                 prompt += (
-                    "\n\nMEMORIE INDEXATA TIPIZATA:\n"
+                    "\n\nMEMORIE INDEXATA TIPIZATA (context secundar):\n"
                     + "\n".join(artifact_lines)
-                    + "\nFoloseste citari tipizate [N#], [Dec#], [P#], [T#], [Ep#] cand utilizezi aceste surse."
+                    + "\nFoloseste-o doar daca e relevanta. Citari tipizate: [N#], [Dec#], [P#], [T#], [Ep#]."
                 )
             return {
                 "prompt": prompt,
@@ -2380,25 +2395,25 @@ RĂSPUNS:"""
         if memory_lines:
             built["prompt"] = (
                 built.get("prompt", "")
-                + "\n\nMEMORIE PERSONALĂ:\n"
+                + "\n\nMEMORIE PERSONALĂ (context secundar — notițele tale anterioare, NU surse primare):\n"
                 + "\n".join(memory_lines)
-                + "\nFolosește citări [M#] când utilizezi memorie personală."
+                + "\nFolosește-o doar dacă e relevantă; prioritizează [D#]/[G#]. Citează [M#] când o folosești."
             )
             built["provenance"].extend(memory_provenance)
         if note_lines:
             built["prompt"] = (
                 built.get("prompt", "")
-                + "\n\nNOTELE TALE PERSONALE:\n"
+                + "\n\nNOTELE TALE PERSONALE (context secundar):\n"
                 + "\n".join(note_lines)
-                + "\nFolosește citări [N#] când utilizezi notele tale."
+                + "\nSunt notițele tale, nu surse primare. Citează [N#] dacă le folosești."
             )
             built["provenance"].extend(note_provenance)
         if artifact_lines:
             built["prompt"] = (
                 built.get("prompt", "")
-                + "\n\nMEMORIE INDEXATA TIPIZATA:\n"
+                + "\n\nMEMORIE INDEXATA TIPIZATA (context secundar):\n"
                 + "\n".join(artifact_lines)
-                + "\nFoloseste citari tipizate [N#], [Dec#], [P#], [T#], [Ep#] cand utilizezi aceste surse."
+                + "\nFoloseste-o doar daca e relevanta. Citari tipizate: [N#], [Dec#], [P#], [T#], [Ep#]."
             )
             built["provenance"].extend(artifact_provenance)
         built["memory_sources"] = memory_hits[:3]
@@ -2441,38 +2456,30 @@ RĂSPUNS:"""
                     return
 
         if self.repository and self.repository.enabled:
-            _push(
-                self.repository.search_preferences(
-                    question=question,
-                    topic_collection=active_collection,
-                    limit=limit,
-                )
-            )
-            if len(memory_hits) < limit:
-                _push(
-                    self.repository.search_tasks(
-                        question=question,
-                        topic_collection=active_collection,
-                        limit=limit,
-                    )
-                )
-            if len(memory_hits) < limit:
-                _push(
-                    self.repository.search_decisions(
-                        question=question,
-                        topic_collection=active_collection,
-                        limit=limit,
-                    )
-                )
-            if len(memory_hits) < limit:
-                _push(
-                    self.repository.search_episodes(
-                        question=question,
-                        topic_collection=active_collection,
-                        limit=limit,
-                        time_window_days=time_window_days,
-                    )
-                )
+            # Cele 4 cautari sunt independente -> le rulam in paralel (cautare text,
+            # fara encode), in loc de pana la 4 round-trip-uri Postgres secventiale.
+            searches = [
+                lambda: self.repository.search_preferences(
+                    question=question, topic_collection=active_collection, limit=limit,
+                ),
+                lambda: self.repository.search_tasks(
+                    question=question, topic_collection=active_collection, limit=limit,
+                ),
+                lambda: self.repository.search_decisions(
+                    question=question, topic_collection=active_collection, limit=limit,
+                ),
+                lambda: self.repository.search_episodes(
+                    question=question, topic_collection=active_collection, limit=limit,
+                    time_window_days=time_window_days,
+                ),
+            ]
+            with ThreadPoolExecutor(max_workers=4) as mem_pool:
+                # map pastreaza ordinea (preferinte > task-uri > decizii > episoade),
+                # deci prioritizarea la dedup/limit ramane identica cu varianta secventiala.
+                for items in mem_pool.map(lambda fn: fn() or [], searches):
+                    _push(items)
+                    if len(memory_hits) >= limit:
+                        break
         elif self.graph_query and self.graph_query.enabled:
             _push(
                 self.graph_query.retrieve_decisions(
@@ -2766,6 +2773,8 @@ RĂSPUNS:"""
         Returneaza {auto_saved: [...], proposed: [...]} pentru a fi propagate
         in result-ul query() si afisate in chat.
         """
+        if self.config.test_mode:
+            return {"auto_saved": [], "proposed": []}  # Mod testare: fara scriere memorie.
         result = {"auto_saved": [], "proposed": []}
         for cand in candidates or []:
             conf = float(cand.get("confidence", 0.0) or 0.0)
@@ -2813,6 +2822,8 @@ RĂSPUNS:"""
         persistent proposal when Postgres is available, and is still returned
         to the UI for inline confirmation.
         """
+        if self.config.test_mode:
+            return {"auto_saved": [], "proposed": []}  # Mod testare: fara scriere memorie.
         result = {"auto_saved": [], "proposed": []}
         clean_type = (proposal_type or "").strip().lower()
         if clean_type not in {"task", "decision", "preference"}:
@@ -3128,6 +3139,8 @@ RĂSPUNS:"""
         active_collection: Optional[str],
     ) -> None:
         """Store lightweight episodic memory for local fallback mode."""
+        if self.config.test_mode:
+            return  # Mod testare: nu capturam episoade (evitam auto-contaminarea).
         question_clean = (question or "").strip()
         response_clean = (response or "").strip()
         if not question_clean or not response_clean:
@@ -3521,6 +3534,11 @@ INSTRUCȚIUNI:
         start_time = time.time()
         self.stats["total_queries"] += 1
 
+        # Mod testare: fara memorie personala in context (doar documente + graf),
+        # ca raspunsurile sa nu fie poluate de Q&A-uri anterioare (auto-contaminare).
+        if self.config.test_mode:
+            include_memory = False
+
         # Web search forcat: skip retrievalul intern complet.
         if force_web:
             memory_hits = self._retrieve_memory_hits(
@@ -3555,19 +3573,54 @@ INSTRUCȚIUNI:
             )
 
             # Embedding plain al intrebarii, calculat o singura data si reutilizat
-            # pentru vector search, note si memory artifacts (evita 3x re-encode).
+            # pentru vector search, note si memory artifacts (evita re-encode).
             shared_query_embedding = self._embed_note_text("", question)
+            # Scope note/artifacts: in mod "topic" strict doar topicul curent.
+            notes_topic_scope = active_collection if scope_mode == "topic" else None
+            memory_topic_scope = active_collection if scope_mode == "topic" else None
 
-            # Regăsește context vectorial.
-            vector_docs = self._run_vector_retrieval(
-                question,
-                scope_filter=scope_filter,
-                collection_filters=collection_filters,
-                k=self.config.max_context_docs,
-                base_embedding=shared_query_embedding,
-            )
+            # Retrieval-uri independente rulate IN PARALEL: vectorial + memorie +
+            # note + memory artifacts. Doar retrievalul vectorial atinge modelul de
+            # embeddings (la HyDE); restul folosesc embedding precomputat sau cautare
+            # text -> fara encode concurent. Colapseaza ~6 round-trip-uri Postgres
+            # secventiale intr-o singura unda paralela (castig pe TOATE rutele).
+            with ThreadPoolExecutor(max_workers=4) as retrieval_pool:
+                f_vector = retrieval_pool.submit(
+                    self._run_vector_retrieval,
+                    question,
+                    scope_filter=scope_filter,
+                    collection_filters=collection_filters,
+                    k=self.config.max_context_docs,
+                    base_embedding=shared_query_embedding,
+                )
+                f_memory = retrieval_pool.submit(
+                    self._retrieve_memory_hits,
+                    question=question,
+                    active_collection=active_collection,
+                    limit=5,
+                    time_window_days=time_window_days,
+                ) if include_memory else None
+                f_notes = retrieval_pool.submit(
+                    self.search_notes,
+                    query=question,
+                    topic_collection=notes_topic_scope,
+                    top_k=3,
+                    precomputed_embedding=shared_query_embedding,
+                ) if include_memory else None
+                f_artifacts = retrieval_pool.submit(
+                    self.search_memory_artifacts,
+                    query=question,
+                    topic_collection=memory_topic_scope,
+                    top_k=6,
+                    precomputed_embedding=shared_query_embedding,
+                ) if include_memory else None
 
-            # Router intent -> retrieval plan.
+                vector_docs = f_vector.result()
+                memory_hits = f_memory.result() if f_memory else []
+                note_hits = f_notes.result() if f_notes else []
+                memory_artifact_hits = f_artifacts.result() if f_artifacts else []
+
+            # Router intent -> retrieval plan (foloseste rezultatul vectorial).
             vector_confidence = (
                 self.hybrid_fusion.estimate_vector_confidence(vector_docs)
                 if self.hybrid_fusion is not None
@@ -3590,6 +3643,7 @@ INSTRUCȚIUNI:
                 route_used = "vector"
                 router_reason = "query intelligence unavailable"
 
+            # Graf doar pe ruta hibrida (dupa router) — depinde de plan.
             graph_paths: List[Dict[str, Any]] = []
             if route_used == "hybrid" and self.config.enable_graph_rag:
                 graph_paths = self._run_graph_retrieval(
@@ -3597,32 +3651,6 @@ INSTRUCȚIUNI:
                     active_collection=active_collection,
                     max_paths=self.config.graph_top_k_paths,
                 )
-
-            memory_hits = self._retrieve_memory_hits(
-                question=question,
-                active_collection=active_collection,
-                limit=5,
-                time_window_days=time_window_days,
-            ) if include_memory else []
-
-            # Vector search peste notele utilizatorului (primitiva Second Brain).
-            # Scope: daca esti intr-un notebook in mod "topic" strict, doar notele acelui topic.
-            # Altfel (topic_general / all / Second Brain), toate notele.
-            notes_topic_scope = active_collection if scope_mode == "topic" else None
-            note_hits = self.search_notes(
-                query=question,
-                topic_collection=notes_topic_scope,
-                top_k=3,
-                precomputed_embedding=shared_query_embedding,
-            ) if include_memory else []
-
-            memory_topic_scope = active_collection if scope_mode == "topic" else None
-            memory_artifact_hits = self.search_memory_artifacts(
-                query=question,
-                topic_collection=memory_topic_scope,
-                top_k=6,
-                precomputed_embedding=shared_query_embedding,
-            ) if include_memory else []
 
             if not vector_docs and not graph_paths and not note_hits and not memory_artifact_hits:
                 return self._run_external_fallback(
@@ -3802,7 +3830,15 @@ INSTRUCȚIUNI:
             # Rate limiting
             self.rate_limiter.wait_if_needed()
             self.rate_limiter.add_request()
-            
+
+            # DEBUG: afiseaza in consola contextul/promptul exact trimis la LLM.
+            print(
+                "\n" + "=" * 80
+                + f"\n[LLM PROMPT] route={route_used} | len={len(prompt)} chars"
+                + "\n" + "-" * 80 + f"\n{prompt}\n" + "=" * 80,
+                flush=True,
+            )
+
             # Generează răspuns
             response = self.llm.generate(prompt)
             self.stats["llm_calls"] += 1

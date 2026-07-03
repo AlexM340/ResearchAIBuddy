@@ -77,6 +77,9 @@ class HybridEvidenceFusion:
             evidence_id = f"G{idx + 1}"
             source_ref = {
                 "concept": item.get("concept", ""),
+                # Textul chunk-ului de graf — propagat in graph_sources ca sa fie
+                # vizibil in loguri/evaluare (altfel apare doar eticheta conceptului).
+                "content": item.get("content", ""),
                 "document_id": item.get("document_id", ""),
                 "artifact_id": item.get("artifact_id", ""),
                 "artifact_type": item.get("artifact_type", ""),

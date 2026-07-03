@@ -1,0 +1,42 @@
+[
+  {"id": "F01", "category": "F", "expected_route": "vector", "documents": ["D01"], "text": "Ce problemă încearcă să rezolve arhitectura RAG?"},
+  {"id": "F02", "category": "F", "expected_route": "vector", "documents": ["D01"], "text": "Care este diferența dintre memoria parametrică și memoria non-parametrică într-un sistem RAG?"},
+  {"id": "F03", "category": "F", "expected_route": "vector", "documents": ["D02"], "text": "Cum permite Sentence-BERT compararea eficientă a propozițiilor?"},
+  {"id": "F04", "category": "F", "expected_route": "vector", "documents": ["D03"], "text": "Cum sunt obținute embeddings multilingve prin distilarea cunoștințelor?"},
+  {"id": "F05", "category": "F", "expected_route": "vector", "documents": ["D04"], "text": "Cum construiește HyDE reprezentarea folosită pentru regăsire?"},
+  {"id": "F06", "category": "F", "expected_route": "vector", "documents": ["D05"], "text": "Cum este organizat un index HNSW?"},
+  {"id": "F07", "category": "F", "expected_route": "vector", "documents": ["D06"], "text": "Ce rol are cross-encoderul în etapa de reranking?"},
+  {"id": "F08", "category": "F", "expected_route": "vector", "documents": ["D07"], "text": "De ce sunt dificile întrebările globale pentru un RAG bazat doar pe fragmente locale?"},
+  {"id": "F09", "category": "F", "expected_route": "vector", "documents": ["D09"], "text": "Ce componente ale unui sistem RAG sunt evaluate separat în RAGAS?"},
+  {"id": "F10", "category": "F", "expected_route": "vector", "documents": ["D10"], "text": "Ce reprezintă problema „lost in the middle”?"},
+
+  {"id": "X01", "category": "X", "expected_route": "vector", "documents": ["D02"], "text": "De ce este costisitor să comparăm fiecare întrebare cu toate pasajele folosind direct un model BERT?"},
+  {"id": "X02", "category": "X", "expected_route": "vector", "documents": ["D04"], "text": "Cum poate un text inventat de model să ajute la găsirea unor documente reale?"},
+  {"id": "X03", "category": "X", "expected_route": "vector", "documents": ["D05"], "text": "Cum ajută o structură ierarhică la găsirea rapidă a vectorilor apropiați?"},
+  {"id": "X04", "category": "X", "expected_route": "vector", "documents": ["D10"], "text": "De ce nu este suficient să introducem toate documentele într-o fereastră de context foarte mare?"},
+  {"id": "X05", "category": "X", "expected_route": "vector", "documents": ["D03"], "text": "Cum pot întrebările în română recupera pasaje relevante din documente scrise în engleză?"},
+
+  {"id": "C01", "category": "C", "expected_route": "hybrid", "documents": ["D04", "D06"], "text": "Care este diferența dintre HyDE și reranking în fluxul de regăsire?"},
+  {"id": "C02", "category": "C", "expected_route": "hybrid", "documents": ["D02", "D06"], "text": "Cum diferă un bi-encoder de un cross-encoder folosit pentru reranking?"},
+  {"id": "C03", "category": "C", "expected_route": "hybrid", "documents": ["D05", "D06"], "text": "Cum se completează HNSW și rerankingul într-un sistem RAG?"},
+  {"id": "C04", "category": "C", "expected_route": "hybrid", "documents": ["D07", "D08"], "text": "Care sunt diferențele principale dintre GraphRAG și LightRAG?"},
+  {"id": "C05", "category": "C", "expected_route": "hybrid", "documents": ["D01", "D10"], "text": "Cum se raportează problema „lost in the middle” la folosirea RAG?"},
+  {"id": "C06", "category": "C", "expected_route": "hybrid", "documents": ["D01", "D09"], "text": "Care este diferența dintre evaluarea regăsirii și evaluarea fidelității răspunsului?"},
+
+  {"id": "G01", "category": "G", "expected_route": "hybrid", "documents": [], "text": "Ce componente ale unui sistem RAG depind de embeddings?"},
+  {"id": "G02", "category": "G", "expected_route": "hybrid", "documents": [], "text": "Ce tehnici încearcă să îmbunătățească interogarea înainte de căutarea vectorială?"},
+  {"id": "G03", "category": "G", "expected_route": "hybrid", "documents": [], "text": "Ce tehnici sunt aplicate după recuperarea inițială a fragmentelor?"},
+  {"id": "G04", "category": "G", "expected_route": "hybrid", "documents": [], "text": "Cum se leagă GraphRAG de problema întrebărilor globale?"},
+  {"id": "G05", "category": "G", "expected_route": "hybrid", "documents": [], "text": "Ce relație există între dimensiunea contextului, selecția fragmentelor și reranking?"},
+
+  {"id": "N01", "category": "N", "expected_route": "external", "documents": [], "text": "Care este prețul actual al API-ului Gemini?"},
+  {"id": "N02", "category": "N", "expected_route": "external", "documents": [], "text": "Care sunt valorile exacte ale parametrilor HNSW folosiți în CerebrumAI?"},
+  {"id": "N03", "category": "N", "expected_route": "external", "documents": [], "text": "Care este cea mai recentă versiune stabilă de Neo4j?"},
+  {"id": "N04", "category": "N", "expected_route": "external", "documents": [], "text": "Ce obligații juridice GDPR se aplică implementării CerebrumAI?"},
+
+  {"id": "M01", "category": "M", "expected_route": "memory", "documents": [], "text": "Ce metrici am decis să folosesc pentru regăsire?"},
+  {"id": "M02", "category": "M", "expected_route": "memory", "documents": [], "text": "În ce limbă prefer să fie redactate rezultatele?"},
+  {"id": "M03", "category": "M", "expected_route": "memory", "documents": [], "text": "Ce task am legat de întrebările despre HyDE?"},
+  {"id": "M04", "category": "M", "expected_route": "memory", "documents": [], "text": "Ce sursă am decis să nu includ în corpus?"},
+  {"id": "M05", "category": "M", "expected_route": "memory", "documents": [], "text": "Ce test trebuie refăcut înainte de evaluarea finală?"}
+]

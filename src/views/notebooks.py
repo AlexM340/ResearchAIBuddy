@@ -500,7 +500,7 @@ def _render_notebook_chat(notebook_name: str) -> None:
 
     focus_only = st.checkbox(
         "Doar surse din acest notebook (ignora memoria globala)",
-        value=False,
+        value=True,
         key=f"nb_focus_{notebook_name}",
         help="Daca e activ, raspunsul se bazeaza strict pe documentele din notebook.",
     )

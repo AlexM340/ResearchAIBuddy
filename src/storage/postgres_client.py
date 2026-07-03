@@ -73,7 +73,11 @@ class PostgresClient:
                         conninfo=self.dsn,
                         min_size=self.pool_min_size,
                         max_size=self.pool_max_size,
-                        kwargs={"autocommit": False},
+                        # prepare_threshold=None dezactiveaza prepared statements:
+                        # obligatoriu cu poolere in mod tranzactie (Supabase/PgBouncer pe
+                        # 6543), altfel apar erori "prepared statement _pgN already exists"
+                        # cand conexiunile sunt reutilizate prin pooler.
+                        kwargs={"autocommit": False, "prepare_threshold": None},
                         open=True,
                     )
                 except Exception as exc:
@@ -103,7 +107,7 @@ class PostgresClient:
         # Fallback: one-shot connection (no pooling available).
         conn = None
         try:
-            conn = psycopg.connect(self.dsn, autocommit=False)
+            conn = psycopg.connect(self.dsn, autocommit=False, prepare_threshold=None)
             yield conn
         finally:
             if conn is not None:

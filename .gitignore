@@ -40,6 +40,9 @@ nul
 .env.production
 .env
 
+# Streamlit secrets (pastreaza doar exemplul .example)
+.streamlit/secrets.toml
+
 # Temporary
 temp/
 tmp/
